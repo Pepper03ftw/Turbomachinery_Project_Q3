@@ -91,12 +91,12 @@ in.loss_model.type = 'modular_literature';
 %   - directly literature-backed defaults, and
 %   - first-pass assumed geometric / empirical inputs to be updated later.
 
-% 1) Denton idealized BL/profile loss
+% 1) Denton idealized BL/profile loss (viscous dissipation)
 in.loss_model.profile.enabled = true;
 in.loss_model.profile.Cd_bl = 0.002;      % literature-backed default
 in.loss_model.profile.dV_over_Vbar = 1/3; % lecture optimum for first pass
 
-% 2) Denton TE / wake-mixing loss
+% 2) Denton TE / wake-mixing loss (mixing out loss)
 in.loss_model.trailing_edge.enabled = true;
 in.loss_model.trailing_edge.use_direct_t_over_s = true;
 in.loss_model.trailing_edge.t_over_s = 0.10;    % assumed initial value
@@ -110,12 +110,12 @@ in.loss_model.shock.enabled = true;
 in.loss_model.shock.M_crit = 1.0;               % apply only above this Mach
 in.loss_model.shock.apply_to = 'outlet';        % 'outlet' or 'max'
 
-% 4) Approximate leakage-loss estimate
+% 4) Approximate leakage-loss estimate (tip-leakage)
 in.loss_model.tip.enabled_rotor = true;
 in.loss_model.tip.enabled_stator = false;
 in.loss_model.tip.Cd_tip = 0.002;               % first-pass choice, same order as BL Cd
 
-% 5) Endwall / secondary loss placeholder
+% 5) Endwall / secondary loss placeholder (secondary flows loss)
 in.loss_model.endwall.enabled_rotor = false;
 in.loss_model.endwall.enabled_stator = false;
 in.loss_model.endwall.rotor_zeta = 0.0;         % only used if enabled

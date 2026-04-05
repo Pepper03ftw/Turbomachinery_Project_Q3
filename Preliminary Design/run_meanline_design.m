@@ -65,31 +65,80 @@ fprintf('  endwall          : %.4f\n', out.loss.breakdown.stator.endwall);
 % Optional parametric sweep over duty coefficients.
 phi_vec = linspace(0.35,1.15,81);
 psi_vec = linspace(0.20,0.80,81);
-ETA  = nan(numel(psi_vec), numel(phi_vec));
-GRES = nan(numel(psi_vec), numel(phi_vec));
+
+ETA  = nan(numel(psi_vec), numel(phi_vec));   % efficiency shown only for feasible points
+GRES = nan(numel(psi_vec), numel(phi_vec));   % max inequality residual
+FEAS = false(numel(psi_vec), numel(phi_vec)); % feasibility mask
+
+% Store a reference design point separately
+in_ref  = default_fan_inputs();
+out_ref = meanline_fan_design(in_ref);
 
 for i = 1:numel(psi_vec)
     for j = 1:numel(phi_vec)
         in = default_fan_inputs();
-        in.phi = phi_vec(j);
+        in.phi = phi_vec(j);   % initial guess / selected phi
         in.psi = psi_vec(i);
 
-        out = meanline_fan_design(in);
+        try
+            out = meanline_fan_design(in);
 
-        ETA(i,j)  = out.performance.eta_tt_est;
-        GRES(i,j) = max(out.constraints.residuals.all_ineq);
+            % Only keep points that returned finite values
+            if isfinite(out.performance.eta_tt_est) && ...
+               all(isfinite(out.constraints.residuals.all_ineq))
+
+                GRES(i,j) = max(out.constraints.residuals.all_ineq);
+
+                % Feasible means all inequality residuals <= 0
+                if GRES(i,j) <= 0
+                    FEAS(i,j) = true;
+                    ETA(i,j)  = out.performance.eta_tt_est;
+                end
+            end
+
+        catch
+            % Leave ETA/GRES as NaN for failed or nonphysical points
+            ETA(i,j)  = NaN;
+            GRES(i,j) = NaN;
+        end
     end
 end
 
 figure;
-contourf(phi_vec, psi_vec, ETA, 20, 'LineColor', 'none');
+contourf(phi_vec, psi_vec, ETA, 40, 'LineColor', 'none');
 cb = colorbar;
 cb.Label.String = 'Estimated total-to-total efficiency, \eta_{tt} [-]';
 hold on;
-contour(phi_vec, psi_vec, GRES, [0 0], 'k', 'LineWidth', 1.5);
-plot(out.coeffs.phi_used, in.psi, 'wo', 'MarkerFaceColor', 'k');
+
+% Plot feasibility boundary only where residual field exists
+if any(isfinite(GRES(:)))
+    contour(phi_vec, psi_vec, GRES, [0 0], 'k', 'LineWidth', 1.5);
+end
+
+% Plot the reference design point
+plot(out_ref.coeffs.phi_used, in_ref.psi, 'wo', ...
+    'MarkerFaceColor', 'k', 'MarkerSize', 7);
+
 xlabel('\phi');
 ylabel('\psi');
+title('Feasible-region efficiency map');
+
+% Optional: tighten color scaling to actual feasible range
+eta_min = min(ETA(:), [], 'omitnan');
+eta_max = max(ETA(:), [], 'omitnan');
+if isfinite(eta_min) && isfinite(eta_max) && eta_max > eta_min
+    clim([eta_min eta_max]);
+end
+
+grid on;
+box on;
+
+% Helpful console output
+fprintf('Feasible points: %d / %d\n', nnz(FEAS), numel(FEAS));
+fprintf('ETA min/max over feasible points: %.4f / %.4f\n', ...
+    min(ETA(:),[],'omitnan'), max(ETA(:),[],'omitnan'));
+fprintf('GRES min/max: %.4f / %.4f\n', ...
+    min(GRES(:),[],'omitnan'), max(GRES(:),[],'omitnan'));
 
 % figure;
 % contourf(phi_vec, psi_vec, ETA, 20, 'LineColor', 'none');
