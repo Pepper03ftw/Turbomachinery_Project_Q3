@@ -67,6 +67,14 @@ in.blade_height_factor = 0.9;
 in.rotor_tip_clearance = 0.0005;   % m
 in.stator_hub_clearance = 0.0;     % m
 
+% Spanwise / radial evaluation defaults for preliminary hub-mean-tip loss models
+% These use the current meanline triangles to create provisional radial
+% sections. Once MEANGEN/STAGEN/MULTALL are connected, the generated
+% section-resolved angles, Mach numbers, pitches, and blade metal angles can
+% replace these estimates without changing the loss-model interfaces.
+in.loss_model.radial.vtheta_mode = 'constant_vtheta';  % 'constant_vtheta' or 'free_vortex'
+in.loss_model.radial.pitch_mode = 'scale_with_radius'; % blade count fixed: pitch proportional to radius
+
 % Air model
 in.air.gamma = 1.4;
 in.air.R = 287.05;
@@ -105,10 +113,56 @@ in.loss_model.trailing_edge.use_bl_terms = false;
 in.loss_model.trailing_edge.theta_over_s = 0.0; % only used if use_bl_terms = true
 in.loss_model.trailing_edge.dstar_over_s = 0.0; % only used if use_bl_terms = true
 
-% 3) Shock loss from normal-shock entropy relation
+% 3) Shock loss model
+% Supported models:
+%   'freeman_cumpsty_inlet_cv' : Freeman-Cumpsty 1-D inlet-region control
+%                                volume. This solves the combined mass,
+%                                relative-stagnation-enthalpy and momentum
+%                                equation for the post-shock subsonic Mach.
+%   'weak_shock_entropy'       : previous weak-shock entropy scaling.
 in.loss_model.shock.enabled = true;
-in.loss_model.shock.M_crit = 1.0;               % apply only above this Mach
-in.loss_model.shock.apply_to = 'outlet';        % 'outlet' or 'max'
+in.loss_model.shock.enabled_rotor = true;
+in.loss_model.shock.enabled_stator = false;     % stator shock off unless explicitly enabled
+in.loss_model.shock.model = 'freeman_cumpsty_inlet_cv';
+in.loss_model.shock.M_crit = 1.0;               % apply only above this inlet Mach
+
+% Current default: evaluate the Freeman-Cumpsty model at the blade tip,
+% because the transonic fan shock loss is tip/outer-span dominated. Future
+% options already supported: 'hub', 'mean', 'tip', 'hub_tip', 'hub_mean_tip'.
+in.loss_model.shock.evaluate_at = 'tip';
+in.loss_model.shock.rotor_evaluate_at = 'tip';
+in.loss_model.shock.stator_evaluate_at = 'mean';
+
+% Blade inlet metal angle for Freeman-Cumpsty. With 'zero_incidence', the
+% code sets chi_1 = beta_1 - design_incidence. Later, switch to
+% 'user_sections' and provide rotor_chi1_hub_deg, rotor_chi1_mean_deg,
+% rotor_chi1_tip_deg from MEANGEN/STAGEN/MULTALL blade profiles.
+in.loss_model.shock.blade_angle_mode = 'zero_incidence'; % 'zero_incidence', 'user', or 'user_sections'
+in.loss_model.shock.design_incidence_deg = 0.0;
+in.loss_model.shock.rotor_design_incidence_deg = 0.0;
+in.loss_model.shock.stator_design_incidence_deg = 0.0;
+in.loss_model.shock.rotor_chi1_deg = NaN;
+in.loss_model.shock.stator_chi1_deg = NaN;
+in.loss_model.shock.rotor_chi1_hub_deg = NaN;
+in.loss_model.shock.rotor_chi1_mean_deg = NaN;
+in.loss_model.shock.rotor_chi1_tip_deg = NaN;
+in.loss_model.shock.stator_chi1_hub_deg = NaN;
+in.loss_model.shock.stator_chi1_mean_deg = NaN;
+in.loss_model.shock.stator_chi1_tip_deg = NaN;
+
+% Freeman-Cumpsty thickness over inlet staggered gap, t/s. The default 0.075
+% matches the representative finite-thickness case discussed in their paper.
+in.loss_model.shock.t_over_s = 0.075;
+in.loss_model.shock.rotor_t_over_s = 0.075;
+in.loss_model.shock.stator_t_over_s = 0.075;
+in.loss_model.shock.rotor_t_over_s_hub = NaN;
+in.loss_model.shock.rotor_t_over_s_mean = NaN;
+in.loss_model.shock.rotor_t_over_s_tip = NaN;
+in.loss_model.shock.stator_t_over_s_hub = NaN;
+in.loss_model.shock.stator_t_over_s_mean = NaN;
+in.loss_model.shock.stator_t_over_s_tip = NaN;
+in.loss_model.shock.fallback = 'normal_shock';  % if the inlet-CV solve fails
+in.loss_model.shock.apply_to = 'outlet';        % only used by weak_shock_entropy
 
 % 4) Tip-leakage loss estimate
 % Supported models:
@@ -144,10 +198,48 @@ in.loss_model.tip.stator_uSS_over_Vx = NaN;
 in.loss_model.tip.stator_uPS_over_Vx = NaN;
 in.loss_model.tip.stator_x_over_Cs = NaN;
 
-% 5) Endwall / secondary loss placeholder (secondary flows loss)
-in.loss_model.endwall.enabled_rotor = false;
-in.loss_model.endwall.enabled_stator = false;
-in.loss_model.endwall.rotor_zeta = 0.0;         % only used if enabled
-in.loss_model.endwall.stator_zeta = 0.0;        % only used if enabled
+% 5) Endwall boundary-layer loss baseline
+% Supported models:
+%   'hall_denton_cd_baseline' : Hall/Denton constant-C_D endwall BL
+%                               dissipation only. This is NOT a full
+%                               secondary-flow/corner-separation model.
+%   'user_constant'           : row-wise constant zeta placeholders below.
+in.loss_model.endwall.enabled_rotor = true;
+in.loss_model.endwall.enabled_stator = true;
+in.loss_model.endwall.model = 'hall_denton_cd_baseline';
+in.loss_model.endwall.secondary_model = 'none';       % reserved for future MULTALL/STAGEN extraction
+
+% Hall/Denton constant dissipation-coefficient assumption for turbulent
+% endwall boundary layers.
+in.loss_model.endwall.Cd = 0.002;
+in.loss_model.endwall.Cs_over_c = 1.0;                % endwall wetted length / chord; update with blade geometry
+in.loss_model.endwall.surface_velocity_mode = 'approx';% 'approx', 'direct', or 'tip_shared'
+in.loss_model.endwall.stagger_mode = 'mean_flow_angles'; % 'mean_flow_angles' or 'user'
+in.loss_model.endwall.rotor_stagger_deg = NaN;        % only used if stagger_mode = 'user'
+in.loss_model.endwall.stator_stagger_deg = NaN;       % only used if stagger_mode = 'user'
+
+% Endwall radial evaluation. Default now evaluates hub and casing/tip as
+% separate endwall surfaces. Supported options: 'mean_combined' (old meanline
+% treatment), 'hub', 'tip', 'hub_tip', and 'hub_mean_tip'.
+in.loss_model.endwall.evaluate_at = 'hub_tip';
+in.loss_model.endwall.rotor_evaluate_at = 'hub_tip';
+in.loss_model.endwall.stator_evaluate_at = 'hub_tip';
+in.loss_model.endwall.rotor_n_endwalls = 2;           % used only by mean_combined legacy mode
+in.loss_model.endwall.stator_n_endwalls = 2;          % used only by mean_combined legacy mode
+
+% Constant-zeta fallback, used only with model = 'user_constant'.
+in.loss_model.endwall.rotor_zeta = 0.0;
+in.loss_model.endwall.stator_zeta = 0.0;
+
+% Direct endwall edge-velocity placeholders for future MULTALL/StageN data.
+% Values are normalized by Vx. Scalars give an algebraic passage average;
+% vectors trigger x/Cs integration with linear pressure-to-suction-side
+% interpolation across the passage at each x-location.
+in.loss_model.endwall.rotor_uSS_over_Vx = NaN;
+in.loss_model.endwall.rotor_uPS_over_Vx = NaN;
+in.loss_model.endwall.rotor_x_over_Cs = NaN;
+in.loss_model.endwall.stator_uSS_over_Vx = NaN;
+in.loss_model.endwall.stator_uPS_over_Vx = NaN;
+in.loss_model.endwall.stator_x_over_Cs = NaN;
 
 end
