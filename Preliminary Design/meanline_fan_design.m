@@ -439,14 +439,67 @@ if isfield(lm,'shock') && lm.shock.enabled
 end
 
 zTL = 0;
+tipDetails = struct('model','none','surface_velocity_mode','none', ...
+    'uSS_over_Vx',NaN,'uPS_over_Vx',NaN,'x_over_Cs',NaN, ...
+    'stagger_deg',NaN,'solidity',NaN,'D_TL',NaN,'I_tip',NaN, ...
+    'Vx',NaN,'velocity_scale',NaN);
 if isfield(lm,'tip') && gap > 0
     enableTip = (strcmpi(rowType,'rotor')  && lm.tip.enabled_rotor) || ...
                 (strcmpi(rowType,'stator') && lm.tip.enabled_stator);
     if enableTip
-        hb = max(span, 1e-6);
-        throatFactor = max(cos(chi_in), 0.1);
-        Cd_tip = lm.tip.Cd_tip;
-        zTL = 2 * Cd_tip * gap * chord / (hb * pitch * throatFactor);
+        switch lower(field_or(lm.tip,'model','legacy_area_proxy'))
+            case 'legacy_area_proxy'
+                % Previous one-line leakage-area proxy. Kept for back-to-back
+                % comparison only.
+                hb = max(span, 1e-6);
+                throatFactor = max(cos(chi_in), 0.1);
+                Cd_tip = field_or(lm.tip,'Cd_tip',0.002);
+                zTL = 2 * Cd_tip * gap * chord / (hb * pitch * throatFactor);
+                tipDetails.model = 'legacy_area_proxy';
+                tipDetails.velocity_scale = max(v_out,1e-8);
+
+            case 'denton_hall_unshrouded_optiona'
+                % Denton/Hall unshrouded tip-clearance loss.
+                % Hall Appendix B gives Phi/(mdot*Vx^2); convert it to the
+                % code convention zeta such that loss = 0.5*zeta*v_out^2.
+                hb = max(span, 1e-6);
+                sigma = chord / max(pitch,1e-8);
+                Cd_leak = field_or(lm.tip,'Cd_leak',0.8);
+                Cs_over_c = field_or(lm.tip,'Cs_over_c',1.0);
+                Cs = Cs_over_c * chord;
+                Vx_row = 0.5*(abs(v_in*cos(chi_in)) + abs(v_out*cos(chi_out)));
+                Vx_row = max(Vx_row, 1e-8);
+
+                [uSS,uPS,x_over_Cs,stagger,modeUsed] = ...
+                    tip_surface_velocity_ratios(rowType, lm.tip, chi_in, chi_out, sigma);
+
+                % Guard against tiny numerical/optimizer excursions outside
+                % the physical domain. If direct velocities are used, this
+                % avoids complex values but does not make bad inputs valid.
+                uSS = max(uSS, 0);
+                uPS = max(uPS, 0);
+                uSS = max(uSS, uPS);
+
+                integrand = uSS .* max(uSS - uPS,0) .* sqrt(max(uSS.^2 - uPS.^2,0));
+                if isscalar(integrand)
+                    I_tip = integrand;
+                else
+                    I_tip = trapz(x_over_Cs, integrand);
+                end
+
+                D_TL = Cd_leak * (gap * Cs)/(hb * chord) * sigma * I_tip;
+                zTL = 2 * D_TL * (Vx_row/max(v_out,1e-8))^2;
+
+                tipDetails = struct('model','denton_hall_unshrouded_optionA', ...
+                    'surface_velocity_mode',modeUsed, ...
+                    'uSS_over_Vx',uSS,'uPS_over_Vx',uPS,'x_over_Cs',x_over_Cs, ...
+                    'stagger_deg',rad2deg(stagger),'solidity',sigma, ...
+                    'D_TL',D_TL,'I_tip',I_tip,'Vx',Vx_row, ...
+                    'velocity_scale',max(v_out,1e-8));
+
+            otherwise
+                error('Unknown tip.model option: %s', lm.tip.model)
+        end
     end
 end
 
@@ -461,7 +514,90 @@ end
 
 row = struct('row_type',rowType, 'profile',zBL, 'trailing_edge',zTE, ...
     'shock',zSW, 'tip',zTL, 'endwall',zEW, ...
+    'tip_details',tipDetails, ...
     'total',zBL + zTE + zSW + zTL + zEW);
+end
+
+function [uSS,uPS,x_over_Cs,stagger,modeUsed] = tip_surface_velocity_ratios(rowType, tip, chi_in, chi_out, sigma)
+modeUsed = lower(field_or(tip,'surface_velocity_mode','approx'));
+switch modeUsed
+    case 'approx'
+        % Hall Appendix-B option-A approximation:
+        %   uSS - uPS ~= Delta(tan chi)/sigma
+        %   uSS + uPS ~= 2/cos(stagger)
+        % where u = V_surface/Vx.  For the rotor, Delta(tan chi)/sigma is
+        % equivalent to psi/(sigma*phi) when chi are row-relative angles.
+        stagger = tip_stagger_angle(rowType, tip, chi_in, chi_out);
+        uDiff = abs(tan(chi_in) - tan(chi_out)) / max(sigma,1e-8);
+        uSum  = 2 / max(cos(stagger),1e-8);
+        uSS = 0.5*(uSum + uDiff);
+        uPS = 0.5*(uSum - uDiff);
+        x_over_Cs = NaN;
+
+    case 'direct'
+        % Direct values are expected to be normalized by Vx. Scalars give
+        % the algebraic form; vectors give the original chordwise integral.
+        [uSS,uPS,x_over_Cs] = tip_direct_surface_velocities(rowType, tip);
+        if numel(uSS) ~= numel(uPS)
+            error('Direct uSS_over_Vx and uPS_over_Vx must have the same length.')
+        end
+        if isscalar(uSS)
+            x_over_Cs = NaN;
+        elseif any(~isfinite(x_over_Cs))
+            x_over_Cs = linspace(0,1,numel(uSS));
+        end
+        stagger = tip_stagger_angle(rowType, tip, chi_in, chi_out);
+
+    otherwise
+        error('Unknown tip.surface_velocity_mode option: %s', modeUsed)
+end
+end
+
+function stagger = tip_stagger_angle(rowType, tip, chi_in, chi_out)
+switch lower(field_or(tip,'stagger_mode','mean_flow_angles'))
+    case 'mean_flow_angles'
+        % Circular-arc / low-camber first pass: stagger is approximated by
+        % the mean of the inlet and outlet row-frame flow angle magnitudes.
+        stagger = 0.5*(chi_in + chi_out);
+    case 'user'
+        if strcmpi(rowType,'rotor')
+            stagger_deg = field_or(tip,'rotor_stagger_deg',NaN);
+        else
+            stagger_deg = field_or(tip,'stator_stagger_deg',NaN);
+        end
+        if ~isfinite(stagger_deg)
+            error('tip.stagger_mode = user requires a finite row-specific stagger angle.')
+        end
+        stagger = deg2rad(stagger_deg);
+    otherwise
+        error('Unknown tip.stagger_mode option: %s', tip.stagger_mode)
+end
+end
+
+function [uSS,uPS,x_over_Cs] = tip_direct_surface_velocities(rowType, tip)
+if strcmpi(rowType,'rotor')
+    uSS = field_or(tip,'rotor_uSS_over_Vx',NaN);
+    uPS = field_or(tip,'rotor_uPS_over_Vx',NaN);
+    x_over_Cs = field_or(tip,'rotor_x_over_Cs',NaN);
+else
+    uSS = field_or(tip,'stator_uSS_over_Vx',NaN);
+    uPS = field_or(tip,'stator_uPS_over_Vx',NaN);
+    x_over_Cs = field_or(tip,'stator_x_over_Cs',NaN);
+end
+if any(~isfinite(uSS(:))) || any(~isfinite(uPS(:)))
+    error('tip.surface_velocity_mode = direct requires finite uSS_over_Vx and uPS_over_Vx values.')
+end
+uSS = uSS(:).';
+uPS = uPS(:).';
+x_over_Cs = x_over_Cs(:).';
+end
+
+function val = field_or(s, name, defaultVal)
+if isfield(s,name)
+    val = s.(name);
+else
+    val = defaultVal;
+end
 end
 
 function out = make_loss_struct(zR, zS, typeLabel, note, breakdown)

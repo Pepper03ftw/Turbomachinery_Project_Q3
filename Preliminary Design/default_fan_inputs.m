@@ -47,7 +47,7 @@ in.design.mean_radius_rule = 'arithmetic';
 % These checks are returned as residuals that can later be passed directly
 % to an optimizer such as fmincon. A residual <= 0 means the constraint is
 % satisfied, while a residual > 0 means the design violates the constraint.
-in.design.DF_limit = 0.60;
+in.design.DF_limit = 0.45;
 in.design.enforce_hard_limits = false;  % if true, solver errors on violated checks
 
 % Exit condition choice
@@ -110,10 +110,39 @@ in.loss_model.shock.enabled = true;
 in.loss_model.shock.M_crit = 1.0;               % apply only above this Mach
 in.loss_model.shock.apply_to = 'outlet';        % 'outlet' or 'max'
 
-% 4) Approximate leakage-loss estimate (tip-leakage)
+% 4) Tip-leakage loss estimate
+% Supported models:
+%   'legacy_area_proxy'             : old one-line leakage-area proxy.
+%   'denton_hall_unshrouded_optionA': Denton/Hall unshrouded leakage model
+%                                      using Appendix-B V_SS/Vx and V_PS/Vx
+%                                      approximations, with optional direct
+%                                      surface-velocity input.
 in.loss_model.tip.enabled_rotor = true;
 in.loss_model.tip.enabled_stator = false;
-in.loss_model.tip.Cd_tip = 0.002;               % first-pass choice, same order as BL Cd
+in.loss_model.tip.model = 'denton_hall_unshrouded_optionA';
+
+% Legacy model coefficient. This is kept only for back-comparison with the
+% previous code path and is not used by the Denton/Hall model.
+in.loss_model.tip.Cd_tip = 0.002;
+
+% Denton/Hall unshrouded model settings.
+in.loss_model.tip.Cd_leak = 0.8;                 % leakage discharge coefficient
+in.loss_model.tip.Cs_over_c = 1.0;               % blade surface length / chord; update when camber geometry is available
+in.loss_model.tip.surface_velocity_mode = 'approx';  % 'approx' or 'direct'
+in.loss_model.tip.stagger_mode = 'mean_flow_angles'; % 'mean_flow_angles' or 'user'
+in.loss_model.tip.rotor_stagger_deg = NaN;       % only used if stagger_mode = 'user'
+in.loss_model.tip.stator_stagger_deg = NaN;      % only used if stagger_mode = 'user'
+
+% Direct surface-velocity placeholders. These allow future MULTALL/StageN
+% output to be connected without changing the loss-model logic. Values are
+% normalized by Vx. Scalars give the option-A algebraic form; vectors trigger
+% numerical integration of the original Denton/Hall integrand over x/Cs.
+in.loss_model.tip.rotor_uSS_over_Vx = NaN;
+in.loss_model.tip.rotor_uPS_over_Vx = NaN;
+in.loss_model.tip.rotor_x_over_Cs = NaN;
+in.loss_model.tip.stator_uSS_over_Vx = NaN;
+in.loss_model.tip.stator_uPS_over_Vx = NaN;
+in.loss_model.tip.stator_x_over_Cs = NaN;
 
 % 5) Endwall / secondary loss placeholder (secondary flows loss)
 in.loss_model.endwall.enabled_rotor = false;
