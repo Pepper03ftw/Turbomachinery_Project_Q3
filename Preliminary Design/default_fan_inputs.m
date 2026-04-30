@@ -102,7 +102,7 @@ in.loss_model.type = 'modular_literature';
 % 1) Denton idealized BL/profile loss (viscous dissipation)
 in.loss_model.profile.enabled = true;
 in.loss_model.profile.Cd_bl = 0.002;      % literature-backed default
-in.loss_model.profile.dV_over_Vbar = 1/3; % lecture optimum for first pass
+in.loss_model.profile.dV_over_Vbar = 1/sqrt(3); % lecture optimum for first pass
 
 % 2) Denton TE / wake-mixing loss (mixing out loss)
 in.loss_model.trailing_edge.enabled = true;
@@ -122,7 +122,7 @@ in.loss_model.trailing_edge.dstar_over_s = 0.0; % only used if use_bl_terms = tr
 %   'weak_shock_entropy'       : previous weak-shock entropy scaling.
 in.loss_model.shock.enabled = true;
 in.loss_model.shock.enabled_rotor = true;
-in.loss_model.shock.enabled_stator = false;     % stator shock off unless explicitly enabled
+in.loss_model.shock.enabled_stator = true;     % stator shock off unless explicitly enabled
 in.loss_model.shock.model = 'freeman_cumpsty_inlet_cv';
 in.loss_model.shock.M_crit = 1.0;               % apply only above this inlet Mach
 

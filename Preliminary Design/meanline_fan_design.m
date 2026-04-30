@@ -209,11 +209,17 @@ howell_ok_rotor  = howell_rotor_residual_deg  <= 0;
 howell_ok_stator = howell_stator_residual_deg <= 0;
 
 % ---------- 7) Diffusion-factor checks ----------
-DF_rotor_generic  = (1 - cos(beta1)/cos(beta2)) + cos(beta1)/(2*in.rotor_solidity) * (tan(beta1)-tan(beta2));
-DF_stator_generic = (1 - cos(alpha2)/cos(alpha3)) + cos(alpha2)/(2*in.stator_solidity) * (tan(alpha2)-tan(alpha3));
+DF_rotor_generic  = (1 - cos(beta1)/cos(beta2)) ...
+                  + cos(beta1)/(2*in.rotor_solidity) * (tan(beta2)-tan(beta1));
 
-DF_rotor_lieblein  = 1 - W2/W1 + (Wt1 - Wt2)/(2*in.rotor_solidity*W1);
-DF_stator_lieblein = 1 - V3/V2 + (Vt2 - Vt3)/(2*in.stator_solidity*V2);
+DF_stator_generic = (1 - cos(alpha2)/cos(alpha3)) ...
+                  + cos(alpha2)/(2*in.stator_solidity) * (tan(alpha2)-tan(alpha3));
+
+DF_rotor_lieblein  = 1 - W2/W1 ...
+                   + (Wt2 - Wt1)/(2*in.rotor_solidity*W1);
+
+DF_stator_lieblein = 1 - V3/V2 ...
+                   + (Vt2 - Vt3)/(2*in.stator_solidity*V2);
 
 DF_rotor_residual  = DF_rotor_lieblein  - in.design.DF_limit;
 DF_stator_residual = DF_stator_lieblein - in.design.DF_limit;
