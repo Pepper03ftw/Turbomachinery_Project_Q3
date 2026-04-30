@@ -114,55 +114,83 @@ in.loss_model.trailing_edge.theta_over_s = 0.0; % only used if use_bl_terms = tr
 in.loss_model.trailing_edge.dstar_over_s = 0.0; % only used if use_bl_terms = true
 
 % 3) Shock loss model
-% Supported models:
-%   'freeman_cumpsty_inlet_cv' : Freeman-Cumpsty 1-D inlet-region control
-%                                volume. This solves the combined mass,
-%                                relative-stagnation-enthalpy and momentum
-%                                equation for the post-shock subsonic Mach.
-%   'weak_shock_entropy'       : previous weak-shock entropy scaling.
+% Supported active model:
+%   'koch_smith_le_and_passage' : Koch-Smith compressor shock model. It
+%                                 separately estimates leading-edge
+%                                 bluntness shock entropy and passage-shock
+%                                 entropy. The passage-shock component uses
+%                                 a representative passage inlet Mach number
+%                                 based primarily on maximum suction-surface
+%                                 Mach number.
 in.loss_model.shock.enabled = true;
 in.loss_model.shock.enabled_rotor = true;
-in.loss_model.shock.enabled_stator = true;     % stator shock off unless explicitly enabled
-in.loss_model.shock.model = 'freeman_cumpsty_inlet_cv';
-in.loss_model.shock.M_crit = 1.0;               % apply only above this inlet Mach
+in.loss_model.shock.enabled_stator = true;    % switch on only if stator shocks are expected
+in.loss_model.shock.model = 'koch_smith_le_and_passage';
+in.loss_model.shock.M_crit = 1.0;              % LE bluntness active for M1 > M_crit
 
-% Current default: evaluate the Freeman-Cumpsty model at the blade tip,
-% because the transonic fan shock loss is tip/outer-span dominated. Future
-% options already supported: 'hub', 'mean', 'tip', 'hub_tip', 'hub_mean_tip'.
+% Section selection. Current default evaluates rotor shocks at the tip. The
+% following options are supported: 'hub', 'mean', 'tip', 'hub_tip',
+% 'hub_mean_tip'. Once MEANGEN/STAGEN/MULTALL section data are available,
+% use 'hub_mean_tip' and feed section-resolved Mss/geometry values.
 in.loss_model.shock.evaluate_at = 'tip';
 in.loss_model.shock.rotor_evaluate_at = 'tip';
 in.loss_model.shock.stator_evaluate_at = 'mean';
 
-% Blade inlet metal angle for Freeman-Cumpsty. With 'zero_incidence', the
-% code sets chi_1 = beta_1 - design_incidence. Later, switch to
-% 'user_sections' and provide rotor_chi1_hub_deg, rotor_chi1_mean_deg,
-% rotor_chi1_tip_deg from MEANGEN/STAGEN/MULTALL blade profiles.
-in.loss_model.shock.blade_angle_mode = 'zero_incidence'; % 'zero_incidence', 'user', or 'user_sections'
-in.loss_model.shock.design_incidence_deg = 0.0;
-in.loss_model.shock.rotor_design_incidence_deg = 0.0;
-in.loss_model.shock.stator_design_incidence_deg = 0.0;
-in.loss_model.shock.rotor_chi1_deg = NaN;
-in.loss_model.shock.stator_chi1_deg = NaN;
-in.loss_model.shock.rotor_chi1_hub_deg = NaN;
-in.loss_model.shock.rotor_chi1_mean_deg = NaN;
-in.loss_model.shock.rotor_chi1_tip_deg = NaN;
-in.loss_model.shock.stator_chi1_hub_deg = NaN;
-in.loss_model.shock.stator_chi1_mean_deg = NaN;
-in.loss_model.shock.stator_chi1_tip_deg = NaN;
+% Koch-Smith switches
+in.loss_model.shock.use_le_bluntness = true;
+in.loss_model.shock.use_passage_shock = true;
+in.loss_model.shock.Mss_weight = 6.0;          % M_rep = (6*Mss_max + M1)/7
+in.loss_model.shock.temperature_reference = 'inlet_static'; % 'inlet_static', 'mean_static', 'surface_static'
 
-% Freeman-Cumpsty thickness over inlet staggered gap, t/s. The default 0.075
-% matches the representative finite-thickness case discussed in their paper.
-in.loss_model.shock.t_over_s = 0.075;
-in.loss_model.shock.rotor_t_over_s = 0.075;
-in.loss_model.shock.stator_t_over_s = 0.075;
-in.loss_model.shock.rotor_t_over_s_hub = NaN;
-in.loss_model.shock.rotor_t_over_s_mean = NaN;
-in.loss_model.shock.rotor_t_over_s_tip = NaN;
-in.loss_model.shock.stator_t_over_s_hub = NaN;
-in.loss_model.shock.stator_t_over_s_mean = NaN;
-in.loss_model.shock.stator_t_over_s_tip = NaN;
-in.loss_model.shock.fallback = 'normal_shock';  % if the inlet-CV solve fails
-in.loss_model.shock.apply_to = 'outlet';        % only used by weak_shock_entropy
+% Leading-edge thickness. Koch-Smith Eq. (1) uses t_LE/(b cos beta1), where
+% b is tangential spacing. The code accepts direct t_LE/pitch values, or
+% estimates t_LE/pitch = (t_LE/chord)*(chord/pitch). Default t_LE/chord=0.008
+% is a preliminary thin transonic fan/compressor assumption.
+in.loss_model.shock.tLE_over_chord = 0.008;
+in.loss_model.shock.rotor_tLE_over_chord = 0.008;
+in.loss_model.shock.stator_tLE_over_chord = 0.008;
+in.loss_model.shock.tLE_over_pitch = NaN;
+in.loss_model.shock.rotor_tLE_over_pitch = NaN;
+in.loss_model.shock.stator_tLE_over_pitch = NaN;
+in.loss_model.shock.rotor_tLE_over_pitch_hub = NaN;
+in.loss_model.shock.rotor_tLE_over_pitch_mean = NaN;
+in.loss_model.shock.rotor_tLE_over_pitch_tip = NaN;
+in.loss_model.shock.stator_tLE_over_pitch_hub = NaN;
+in.loss_model.shock.stator_tLE_over_pitch_mean = NaN;
+in.loss_model.shock.stator_tLE_over_pitch_tip = NaN;
+
+% Maximum suction-surface Mach number used by the Koch-Smith passage-shock
+% model. Current default estimates Mss_max from the same low-order surface
+% velocity split used by the tip/endwall models. Later, set Mss_mode='direct'
+% and supply rotor_Mss_max_hub/mean/tip from MULTALL, STAGEN postprocessing,
+% or another blade-to-blade calculation.
+% Supported: 'estimated', 'direct', 'factor'.
+in.loss_model.shock.Mss_mode = 'estimated';
+in.loss_model.shock.Mss_factor = 1.0;          % only used when Mss_mode='factor'
+in.loss_model.shock.rotor_Mss_max = NaN;
+in.loss_model.shock.rotor_Mss_max_hub = NaN;
+in.loss_model.shock.rotor_Mss_max_mean = NaN;
+in.loss_model.shock.rotor_Mss_max_tip = NaN;
+in.loss_model.shock.stator_Mss_max = NaN;
+in.loss_model.shock.stator_Mss_max_hub = NaN;
+in.loss_model.shock.stator_Mss_max_mean = NaN;
+in.loss_model.shock.stator_Mss_max_tip = NaN;
+
+% Stagger approximation used only for Mss_mode='estimated'. Replace with
+% section metal angles once blade profiles are generated.
+in.loss_model.shock.stagger_mode = 'mean_flow_angles'; % 'mean_flow_angles', 'user', or 'user_sections'
+in.loss_model.shock.rotor_stagger_deg = NaN;
+in.loss_model.shock.stator_stagger_deg = NaN;
+in.loss_model.shock.rotor_stagger_hub_deg = NaN;
+in.loss_model.shock.rotor_stagger_mean_deg = NaN;
+in.loss_model.shock.rotor_stagger_tip_deg = NaN;
+in.loss_model.shock.stator_stagger_hub_deg = NaN;
+in.loss_model.shock.stator_stagger_mean_deg = NaN;
+in.loss_model.shock.stator_stagger_tip_deg = NaN;
+
+% Legacy weak-shock setting retained only if shock.model is manually set to
+% 'weak_shock_entropy'.
+in.loss_model.shock.apply_to = 'outlet';
 
 % 4) Tip-leakage loss estimate
 % Supported models:
