@@ -67,14 +67,6 @@ in.blade_height_factor = 0.9;
 in.rotor_tip_clearance = 0.0005;   % m
 in.stator_hub_clearance = 0.0;     % m
 
-% Spanwise / radial evaluation defaults for preliminary hub-mean-tip loss models
-% These use the current meanline triangles to create provisional radial
-% sections. Once MEANGEN/STAGEN/MULTALL are connected, the generated
-% section-resolved angles, Mach numbers, pitches, and blade metal angles can
-% replace these estimates without changing the loss-model interfaces.
-in.loss_model.radial.vtheta_mode = 'constant_vtheta';  % 'constant_vtheta' or 'free_vortex'
-in.loss_model.radial.pitch_mode = 'scale_with_radius'; % blade count fixed: pitch proportional to radius
-
 % Air model
 in.air.gamma = 1.4;
 in.air.R = 287.05;
@@ -87,6 +79,27 @@ in.material.rho_blade = 4500;
 in.howell_paths.f_beta2 = 'Howell_f_beta2.csv';
 in.howell_paths.Phi_Re  = 'Howell_Phi_Re.csv';
 in.howell_paths.Psi_sc  = 'Howell_Psi_solidityINVERSE.csv';
+
+% Lieblein digitized incidence/deviation chart data
+in.lieblein.enabled = true;
+in.lieblein.profile_family = 'NACA65';      % 'NACA65' or 'DCA'
+in.lieblein.default_tmax_over_c = 0.070;    % used if row-specific t/c is not supplied
+in.lieblein.rotor_tmax_over_c = NaN;        % NaN -> rotor_thickness/rotor_chord
+in.lieblein.stator_tmax_over_c = NaN;       % NaN -> default_tmax_over_c
+in.lieblein.Ki_sh_DCA = 0.7;
+in.lieblein.Ki_sh_NACA65 = 1.1;
+in.lieblein.Kdelta_sh_DCA = 0.75;
+in.lieblein.Kdelta_sh_NACA65 = 1.1;
+
+in.lieblein_paths.folder = 'lieblein_digitized';
+in.lieblein_paths.i0_10 = fullfile(in.lieblein_paths.folder,'lieblein_i0_10.csv');
+in.lieblein_paths.n = fullfile(in.lieblein_paths.folder,'lieblein_n.csv');
+in.lieblein_paths.Ki_t = fullfile(in.lieblein_paths.folder,'lieblein_Ki_t.csv');
+in.lieblein_paths.delta0_10 = fullfile(in.lieblein_paths.folder,'lieblein_delta0_10.csv');
+in.lieblein_paths.m_NACA65 = fullfile(in.lieblein_paths.folder,'lieblein_m_NACA65.csv');
+in.lieblein_paths.Kdelta_t = fullfile(in.lieblein_paths.folder,'lieblein_Kdelta_t.csv');
+in.lieblein_paths.b = fullfile(in.lieblein_paths.folder,'lieblein_b.csv');
+
 
 % loss_model.type is a documentation label only. It is printed in outputs so
 % the user can record which literature-based configuration was intended, but
@@ -102,7 +115,7 @@ in.loss_model.type = 'modular_literature';
 % 1) Denton idealized BL/profile loss (viscous dissipation)
 in.loss_model.profile.enabled = true;
 in.loss_model.profile.Cd_bl = 0.002;      % literature-backed default
-in.loss_model.profile.dV_over_Vbar = 1/sqrt(3); % lecture optimum for first pass
+in.loss_model.profile.dV_over_Vbar = 1/3; % lecture optimum for first pass
 
 % 2) Denton TE / wake-mixing loss (mixing out loss)
 in.loss_model.trailing_edge.enabled = true;
@@ -113,161 +126,20 @@ in.loss_model.trailing_edge.use_bl_terms = false;
 in.loss_model.trailing_edge.theta_over_s = 0.0; % only used if use_bl_terms = true
 in.loss_model.trailing_edge.dstar_over_s = 0.0; % only used if use_bl_terms = true
 
-% 3) Shock loss model
-% Supported active model:
-%   'koch_smith_le_and_passage' : Koch-Smith compressor shock model. It
-%                                 separately estimates leading-edge
-%                                 bluntness shock entropy and passage-shock
-%                                 entropy. The passage-shock component uses
-%                                 a representative passage inlet Mach number
-%                                 based primarily on maximum suction-surface
-%                                 Mach number.
+% 3) Shock loss from normal-shock entropy relation
 in.loss_model.shock.enabled = true;
-in.loss_model.shock.enabled_rotor = true;
-in.loss_model.shock.enabled_stator = false;    % switch on only if stator shocks are expected
-in.loss_model.shock.model = 'koch_smith_le_and_passage';
-in.loss_model.shock.M_crit = 1.0;              % LE bluntness active for M1 > M_crit
+in.loss_model.shock.M_crit = 1.0;               % apply only above this Mach
+in.loss_model.shock.apply_to = 'outlet';        % 'outlet' or 'max'
 
-% Section selection. Current default evaluates rotor shocks at the tip. The
-% following options are supported: 'hub', 'mean', 'tip', 'hub_tip',
-% 'hub_mean_tip'. Once MEANGEN/STAGEN/MULTALL section data are available,
-% use 'hub_mean_tip' and feed section-resolved Mss/geometry values.
-in.loss_model.shock.evaluate_at = 'tip';
-in.loss_model.shock.rotor_evaluate_at = 'tip';
-in.loss_model.shock.stator_evaluate_at = 'mean';
-
-% Koch-Smith switches
-in.loss_model.shock.use_le_bluntness = true;
-in.loss_model.shock.use_passage_shock = true;
-in.loss_model.shock.Mss_weight = 6.0;          % M_rep = (6*Mss_max + M1)/7
-in.loss_model.shock.temperature_reference = 'inlet_static'; % 'inlet_static', 'mean_static', 'surface_static'
-
-% Leading-edge thickness. Koch-Smith Eq. (1) uses t_LE/(b cos beta1), where
-% b is tangential spacing. The code accepts direct t_LE/pitch values, or
-% estimates t_LE/pitch = (t_LE/chord)*(chord/pitch). Default t_LE/chord=0.008
-% is a preliminary thin transonic fan/compressor assumption.
-in.loss_model.shock.tLE_over_chord = 0.008;
-in.loss_model.shock.rotor_tLE_over_chord = 0.008;
-in.loss_model.shock.stator_tLE_over_chord = 0.008;
-in.loss_model.shock.tLE_over_pitch = NaN;
-in.loss_model.shock.rotor_tLE_over_pitch = NaN;
-in.loss_model.shock.stator_tLE_over_pitch = NaN;
-in.loss_model.shock.rotor_tLE_over_pitch_hub = NaN;
-in.loss_model.shock.rotor_tLE_over_pitch_mean = NaN;
-in.loss_model.shock.rotor_tLE_over_pitch_tip = NaN;
-in.loss_model.shock.stator_tLE_over_pitch_hub = NaN;
-in.loss_model.shock.stator_tLE_over_pitch_mean = NaN;
-in.loss_model.shock.stator_tLE_over_pitch_tip = NaN;
-
-% Maximum suction-surface Mach number used by the Koch-Smith passage-shock
-% model. Current default estimates Mss_max from the same low-order surface
-% velocity split used by the tip/endwall models. Later, set Mss_mode='direct'
-% and supply rotor_Mss_max_hub/mean/tip from MULTALL, STAGEN postprocessing,
-% or another blade-to-blade calculation.
-% Supported: 'estimated', 'direct', 'factor'.
-in.loss_model.shock.Mss_mode = 'estimated';
-in.loss_model.shock.Mss_factor = 1.0;          % only used when Mss_mode='factor'
-in.loss_model.shock.rotor_Mss_max = NaN;
-in.loss_model.shock.rotor_Mss_max_hub = NaN;
-in.loss_model.shock.rotor_Mss_max_mean = NaN;
-in.loss_model.shock.rotor_Mss_max_tip = NaN;
-in.loss_model.shock.stator_Mss_max = NaN;
-in.loss_model.shock.stator_Mss_max_hub = NaN;
-in.loss_model.shock.stator_Mss_max_mean = NaN;
-in.loss_model.shock.stator_Mss_max_tip = NaN;
-
-% Stagger approximation used only for Mss_mode='estimated'. Replace with
-% section metal angles once blade profiles are generated.
-in.loss_model.shock.stagger_mode = 'mean_flow_angles'; % 'mean_flow_angles', 'user', or 'user_sections'
-in.loss_model.shock.rotor_stagger_deg = NaN;
-in.loss_model.shock.stator_stagger_deg = NaN;
-in.loss_model.shock.rotor_stagger_hub_deg = NaN;
-in.loss_model.shock.rotor_stagger_mean_deg = NaN;
-in.loss_model.shock.rotor_stagger_tip_deg = NaN;
-in.loss_model.shock.stator_stagger_hub_deg = NaN;
-in.loss_model.shock.stator_stagger_mean_deg = NaN;
-in.loss_model.shock.stator_stagger_tip_deg = NaN;
-
-% Legacy weak-shock setting retained only if shock.model is manually set to
-% 'weak_shock_entropy'.
-in.loss_model.shock.apply_to = 'outlet';
-
-% 4) Tip-leakage loss estimate
-% Supported models:
-%   'legacy_area_proxy'             : old one-line leakage-area proxy.
-%   'denton_hall_unshrouded_optionA': Denton/Hall unshrouded leakage model
-%                                      using Appendix-B V_SS/Vx and V_PS/Vx
-%                                      approximations, with optional direct
-%                                      surface-velocity input.
+% 4) Approximate leakage-loss estimate (tip-leakage)
 in.loss_model.tip.enabled_rotor = true;
 in.loss_model.tip.enabled_stator = false;
-in.loss_model.tip.model = 'denton_hall_unshrouded_optionA';
+in.loss_model.tip.Cd_tip = 0.002;               % first-pass choice, same order as BL Cd
 
-% Legacy model coefficient. This is kept only for back-comparison with the
-% previous code path and is not used by the Denton/Hall model.
-in.loss_model.tip.Cd_tip = 0.002;
-
-% Denton/Hall unshrouded model settings.
-in.loss_model.tip.Cd_leak = 0.8;                 % leakage discharge coefficient
-in.loss_model.tip.Cs_over_c = 1.0;               % blade surface length / chord; update when camber geometry is available
-in.loss_model.tip.surface_velocity_mode = 'approx';  % 'approx' or 'direct'
-in.loss_model.tip.stagger_mode = 'mean_flow_angles'; % 'mean_flow_angles' or 'user'
-in.loss_model.tip.rotor_stagger_deg = NaN;       % only used if stagger_mode = 'user'
-in.loss_model.tip.stator_stagger_deg = NaN;      % only used if stagger_mode = 'user'
-
-% Direct surface-velocity placeholders. These allow future MULTALL/StageN
-% output to be connected without changing the loss-model logic. Values are
-% normalized by Vx. Scalars give the option-A algebraic form; vectors trigger
-% numerical integration of the original Denton/Hall integrand over x/Cs.
-in.loss_model.tip.rotor_uSS_over_Vx = NaN;
-in.loss_model.tip.rotor_uPS_over_Vx = NaN;
-in.loss_model.tip.rotor_x_over_Cs = NaN;
-in.loss_model.tip.stator_uSS_over_Vx = NaN;
-in.loss_model.tip.stator_uPS_over_Vx = NaN;
-in.loss_model.tip.stator_x_over_Cs = NaN;
-
-% 5) Endwall boundary-layer loss baseline
-% Supported models:
-%   'hall_denton_cd_baseline' : Hall/Denton constant-C_D endwall BL
-%                               dissipation only. This is NOT a full
-%                               secondary-flow/corner-separation model.
-%   'user_constant'           : row-wise constant zeta placeholders below.
-in.loss_model.endwall.enabled_rotor = true;
-in.loss_model.endwall.enabled_stator = true;
-in.loss_model.endwall.model = 'hall_denton_cd_baseline';
-in.loss_model.endwall.secondary_model = 'none';       % reserved for future MULTALL/STAGEN extraction
-
-% Hall/Denton constant dissipation-coefficient assumption for turbulent
-% endwall boundary layers.
-in.loss_model.endwall.Cd = 0.002;
-in.loss_model.endwall.Cs_over_c = 1.0;                % endwall wetted length / chord; update with blade geometry
-in.loss_model.endwall.surface_velocity_mode = 'approx';% 'approx', 'direct', or 'tip_shared'
-in.loss_model.endwall.stagger_mode = 'mean_flow_angles'; % 'mean_flow_angles' or 'user'
-in.loss_model.endwall.rotor_stagger_deg = NaN;        % only used if stagger_mode = 'user'
-in.loss_model.endwall.stator_stagger_deg = NaN;       % only used if stagger_mode = 'user'
-
-% Endwall radial evaluation. Default now evaluates hub and casing/tip as
-% separate endwall surfaces. Supported options: 'mean_combined' (old meanline
-% treatment), 'hub', 'tip', 'hub_tip', and 'hub_mean_tip'.
-in.loss_model.endwall.evaluate_at = 'hub_tip';
-in.loss_model.endwall.rotor_evaluate_at = 'hub_tip';
-in.loss_model.endwall.stator_evaluate_at = 'hub_tip';
-in.loss_model.endwall.rotor_n_endwalls = 2;           % used only by mean_combined legacy mode
-in.loss_model.endwall.stator_n_endwalls = 2;          % used only by mean_combined legacy mode
-
-% Constant-zeta fallback, used only with model = 'user_constant'.
-in.loss_model.endwall.rotor_zeta = 0.0;
-in.loss_model.endwall.stator_zeta = 0.0;
-
-% Direct endwall edge-velocity placeholders for future MULTALL/StageN data.
-% Values are normalized by Vx. Scalars give an algebraic passage average;
-% vectors trigger x/Cs integration with linear pressure-to-suction-side
-% interpolation across the passage at each x-location.
-in.loss_model.endwall.rotor_uSS_over_Vx = NaN;
-in.loss_model.endwall.rotor_uPS_over_Vx = NaN;
-in.loss_model.endwall.rotor_x_over_Cs = NaN;
-in.loss_model.endwall.stator_uSS_over_Vx = NaN;
-in.loss_model.endwall.stator_uPS_over_Vx = NaN;
-in.loss_model.endwall.stator_x_over_Cs = NaN;
+% 5) Endwall / secondary loss placeholder (secondary flows loss)
+in.loss_model.endwall.enabled_rotor = false;
+in.loss_model.endwall.enabled_stator = false;
+in.loss_model.endwall.rotor_zeta = 0.0;         % only used if enabled
+in.loss_model.endwall.stator_zeta = 0.0;        % only used if enabled
 
 end

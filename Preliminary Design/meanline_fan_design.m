@@ -209,30 +209,45 @@ howell_ok_rotor  = howell_rotor_residual_deg  <= 0;
 howell_ok_stator = howell_stator_residual_deg <= 0;
 
 % ---------- 7) Diffusion-factor checks ----------
-DF_rotor_generic  = (1 - cos(beta1)/cos(beta2)) ...
-                  + cos(beta1)/(2*in.rotor_solidity) * (tan(beta2)-tan(beta1));
+DF_rotor_generic  = (1 - cos(beta1)/cos(beta2)) + cos(beta1)/(2*in.rotor_solidity) * (tan(beta1)-tan(beta2));
+DF_stator_generic = (1 - cos(alpha2)/cos(alpha3)) + cos(alpha2)/(2*in.stator_solidity) * (tan(alpha2)-tan(alpha3));
 
-DF_stator_generic = (1 - cos(alpha2)/cos(alpha3)) ...
-                  + cos(alpha2)/(2*in.stator_solidity) * (tan(alpha2)-tan(alpha3));
-
-DF_rotor_lieblein  = 1 - W2/W1 ...
-                   + (Wt2 - Wt1)/(2*in.rotor_solidity*W1);
-
-DF_stator_lieblein = 1 - V3/V2 ...
-                   + (Vt2 - Vt3)/(2*in.stator_solidity*V2);
+DF_rotor_lieblein  = 1 - W2/W1 + (Wt1 - Wt2)/(2*in.rotor_solidity*W1);
+DF_stator_lieblein = 1 - V3/V2 + (Vt2 - Vt3)/(2*in.stator_solidity*V2);
 
 DF_rotor_residual  = DF_rotor_lieblein  - in.design.DF_limit;
 DF_stator_residual = DF_stator_lieblein - in.design.DF_limit;
 DF_rotor_ok  = DF_rotor_residual  <= 0;
 DF_stator_ok = DF_stator_residual <= 0;
 
+% ---------- 8) Lieblein optimum incidence/deviation estimates ----------
+lieblein = struct('enabled',false);
+if isfield(in,'lieblein') && isfield(in.lieblein,'enabled') && in.lieblein.enabled
+    try
+        lieblein_curves = read_lieblein_curves(in.lieblein_paths);
+        rotor_tmax_over_c = row_tmax_over_c(in,'rotor');
+        stator_tmax_over_c = row_tmax_over_c(in,'stator');
+        lieblein = struct();
+        lieblein.enabled = true;
+        lieblein.rotor = lieblein_row_estimate(lieblein_curves, 'rotor', ...
+            abs(rad2deg(beta1)), abs(rad2deg(beta2)), in.rotor_solidity, ...
+            rotor_tmax_over_c, in.lieblein);
+        lieblein.stator = lieblein_row_estimate(lieblein_curves, 'stator', ...
+            abs(rad2deg(alpha2)), abs(rad2deg(alpha3)), in.stator_solidity, ...
+            stator_tmax_over_c, in.lieblein);
+        lieblein.curve_files = lieblein_curves.files;
+        lieblein.curve_ranges = lieblein_curves.ranges;
+    catch ME
+        lieblein = struct('enabled',false,'error',ME.message);
+        warning('Lieblein incidence/deviation evaluation failed: %s', ME.message);
+    end
+end
+
 % ---------- 8) Literature-based modular loss build-up ----------
 span = rt - rh;
 loss = estimate_losses(in, struct( ...
-    'air',air,'span',span,'rt',rt,'rh',rh,'rm',rm,'omega',omega,'Vx',Vx, ...
-    'alpha1',alpha1,'alpha2',alpha2,'alpha3',alpha3, ...
-    'beta1',beta1,'beta2',beta2,'Vt1',Vt1,'Vt2',Vt2,'Vt3',Vt3, ...
-    'V1',V1,'V2',V2,'V3',V3,'W1',W1,'W2',W2, ...
+    'air',air,'span',span,'alpha1',alpha1,'alpha2',alpha2,'alpha3',alpha3, ...
+    'beta1',beta1,'beta2',beta2,'V1',V1,'V2',V2,'V3',V3,'W1',W1,'W2',W2, ...
     'M2',M2,'M3',M3,'Mrel1',Mrel1,'Mrel2',Mrel2,'T1',T1,'T2',T2,'T3',T3, ...
     'rotor_pitch',in.rotor_pitch,'stator_pitch',in.stator_pitch, ...
     'rotor_chord',in.rotor_chord,'stator_chord',in.stator_chord, ...
@@ -289,7 +304,6 @@ out.geometry = struct('rt',rt,'rh',rh,'rm',rm,'A1',A1, ...
     'rotor_tip_clearance',in.rotor_tip_clearance, ...
     'stator_hub_clearance',in.stator_hub_clearance, ...
     'rotor_blades',rotor_blades,'stator_vanes',stator_vanes, ...
-    'span_sections',{{'hub','mean','tip'}},'r_sections',[rh rm rt], ...
     'solve_mode',in.design.solve_mode,'solve_mode_note',geometry_mode_note);
 
 out.coeffs = struct('phi_initial',phi_initial,'phi_actual',phi_actual,'phi_used',phi, ...
@@ -312,6 +326,7 @@ out.diffusion = struct('rotor_generic',DF_rotor_generic,'stator_generic',DF_stat
     'limit',in.design.DF_limit, ...
     'rotor_residual',DF_rotor_residual,'stator_residual',DF_stator_residual, ...
     'rotor_ok',DF_rotor_ok,'stator_ok',DF_stator_ok);
+out.lieblein = lieblein;
 out.loss = loss;
 out.performance = struct('Delta_h0',Delta_h0,'w_is',w_is,'eta_tt_est',eta_tt_est, ...
     'power_W',Power,'torque_Nm',Torque,'tangential_force_N',Ft_tan, ...
@@ -378,32 +393,51 @@ for i = 1:numel(fn)
 end
 end
 
+
+function tmax_over_c = row_tmax_over_c(in, rowType)
+switch lower(rowType)
+    case 'rotor'
+        if isfield(in,'lieblein') && isfield(in.lieblein,'rotor_tmax_over_c') && ...
+                isfinite(in.lieblein.rotor_tmax_over_c)
+            tmax_over_c = in.lieblein.rotor_tmax_over_c;
+        elseif isfield(in,'rotor_thickness') && isfield(in,'rotor_chord') && in.rotor_chord > 0
+            tmax_over_c = in.rotor_thickness/in.rotor_chord;
+        else
+            tmax_over_c = in.lieblein.default_tmax_over_c;
+        end
+    case 'stator'
+        if isfield(in,'lieblein') && isfield(in.lieblein,'stator_tmax_over_c') && ...
+                isfinite(in.lieblein.stator_tmax_over_c)
+            tmax_over_c = in.lieblein.stator_tmax_over_c;
+        elseif isfield(in,'stator_thickness') && isfield(in,'stator_chord') && in.stator_chord > 0
+            tmax_over_c = in.stator_thickness/in.stator_chord;
+        else
+            tmax_over_c = in.lieblein.default_tmax_over_c;
+        end
+    otherwise
+        error('Unknown rowType for row_tmax_over_c: %s', rowType)
+end
+end
+
 function loss = estimate_losses(in, s)
 % loss_model.type is treated as a documentation label only. The active loss
 % physics is selected solely through the enabled/disabled source terms in
 % default_fan_inputs.m.
-rotorRadial = make_radial_row_data('rotor', in.loss_model, s, ...
-    s.rotor_pitch, s.rotor_chord, s.T1, s.T2);
-statorRadial = make_radial_row_data('stator', in.loss_model, s, ...
-    s.stator_pitch, s.stator_chord, s.T2, s.T3);
-
 rotor = row_loss_published('rotor', in.loss_model, s.air, s.span, ...
     abs(s.beta1), abs(s.beta2), s.W1, s.W2, s.Mrel1, s.Mrel2, s.T1, s.T2, ...
-    s.rotor_pitch, s.rotor_chord, s.rotor_gap, rotorRadial);
+    s.rotor_pitch, s.rotor_chord, s.rotor_gap);
 stator = row_loss_published('stator', in.loss_model, s.air, s.span, ...
     abs(s.alpha2), abs(s.alpha3), s.V2, s.V3, s.M2, s.M3, s.T2, s.T3, ...
-    s.stator_pitch, s.stator_chord, s.stator_gap, statorRadial);
+    s.stator_pitch, s.stator_chord, s.stator_gap);
 
 loss = make_loss_struct(rotor.total, stator.total, in.loss_model.type, ...
     ['Modular literature-based loss model. loss_model.type is a label only; ', ...
      'the included loss sources are controlled exclusively by the enabled ', ...
      'switches in default_fan_inputs.m. Howell/Lieblein are checks only.'], ...
      struct('rotor',rotor,'stator',stator));
-loss.radial.rotor = rotorRadial;
-loss.radial.stator = statorRadial;
 end
 
-function row = row_loss_published(rowType, lm, air, span, chi_in, chi_out, v_in, v_out, Min, Mout, Tin, Tout, pitch, chord, gap, radial)
+function row = row_loss_published(rowType, lm, air, span, chi_in, chi_out, v_in, v_out, Min, Mout, Tin, Tout, pitch, chord, gap)
 % Literature-based modular row loss estimate with all switches controlled
 % from default_fan_inputs.m.
 
@@ -434,849 +468,50 @@ if isfield(lm,'trailing_edge') && lm.trailing_edge.enabled
 end
 
 zSW = 0;
-shockDetails = struct('model','none','evaluate_at','none', ...
-    'section_names',{{}},'section_weights',[],'M1',[],'Mout',[], ...
-    'Mss_max',[],'Mrep',[],'Mtarget',[],'beta1_deg',[], ...
-    'tLE_over_pitch',[],'ds_le_over_R',[],'ds_passage_over_R',[], ...
-    'ds_over_R',[],'h_loss',[],'zeta_sections',[], ...
-    'passage_p02_over_p01',[],'passage_Mn1',[],'passage_M2_actual',[], ...
-    'status',{{}},'Mss_mode','none','velocity_scale',max(v_out,1e-8));
 if isfield(lm,'shock') && lm.shock.enabled
-    switch lower(field_or(lm.shock,'model','weak_shock_entropy'))
-        case {'weak_shock_entropy','weak_normal_shock'}
-            switch lower(field_or(lm.shock,'apply_to','outlet'))
-                case 'outlet'
-                    Mchar = Mout; Tchar = Tout; vref = max(v_out, 1e-6);
-                case 'max'
-                    if Mout >= Min
-                        Mchar = Mout; Tchar = Tout; vref = max(v_out, 1e-6);
-                    else
-                        Mchar = Min; Tchar = Tin; vref = max(v_in, 1e-6);
-                    end
-                otherwise
-                    error('Unknown shock.apply_to option: %s', lm.shock.apply_to)
-            end
-            if Mchar > lm.shock.M_crit
-                ds_over_R = (2/3) * air.gamma / (air.gamma + 1)^2 * (Mchar^2 - 1)^3;
-                Tds = Tchar * air.R * ds_over_R;
-                zSW = Tds / (0.5*vref^2);
+    switch lower(lm.shock.apply_to)
+        case 'outlet'
+            Mchar = Mout; Tchar = Tout; vref = max(v_out, 1e-6);
+        case 'max'
+            if Mout >= Min
+                Mchar = Mout; Tchar = Tout; vref = max(v_out, 1e-6);
             else
-                ds_over_R = 0;
+                Mchar = Min; Tchar = Tin; vref = max(v_in, 1e-6);
             end
-            shockDetails = struct('model','weak_shock_entropy','evaluate_at',field_or(lm.shock,'apply_to','outlet'), ...
-                'section_names',{{'mean'}},'section_weights',1,'M1',Mchar,'M2_cv',NaN, ...
-                'beta1_deg',NaN,'chi1_deg',NaN,'incidence_deg',NaN, ...
-                'thickness_over_gap',NaN,'p02_over_p01_rel',NaN, ...
-                'Yrel',NaN,'ds_over_R',ds_over_R,'h_loss',0.5*zSW*vref^2, ...
-                'zeta_sections',zSW,'velocity_scale',vref);
-
-        case {'koch_smith','koch_smith_le_and_passage','koch_smith_shock'}
-            [zSW, shockDetails] = koch_smith_shock_loss(rowType, lm.shock, air, radial, v_out);
-
         otherwise
-            error('Unknown shock.model option: %s', lm.shock.model)
+            error('Unknown shock.apply_to option: %s', lm.shock.apply_to)
+    end
+    if Mchar > lm.shock.M_crit
+        ds_over_R = (2/3) * air.gamma / (air.gamma + 1)^2 * (Mchar^2 - 1)^3;
+        Tds = Tchar * air.R * ds_over_R;
+        zSW = Tds / (0.5*vref^2);
     end
 end
 
 zTL = 0;
-tipDetails = struct('model','none','surface_velocity_mode','none', ...
-    'uSS_over_Vx',NaN,'uPS_over_Vx',NaN,'x_over_Cs',NaN, ...
-    'stagger_deg',NaN,'solidity',NaN,'D_TL',NaN,'I_tip',NaN, ...
-    'Vx',NaN,'velocity_scale',NaN);
 if isfield(lm,'tip') && gap > 0
     enableTip = (strcmpi(rowType,'rotor')  && lm.tip.enabled_rotor) || ...
                 (strcmpi(rowType,'stator') && lm.tip.enabled_stator);
     if enableTip
-        switch lower(field_or(lm.tip,'model','legacy_area_proxy'))
-            case 'legacy_area_proxy'
-                % Previous one-line leakage-area proxy. Kept for back-to-back
-                % comparison only.
-                hb = max(span, 1e-6);
-                throatFactor = max(cos(chi_in), 0.1);
-                Cd_tip = field_or(lm.tip,'Cd_tip',0.002);
-                zTL = 2 * Cd_tip * gap * chord / (hb * pitch * throatFactor);
-                tipDetails.model = 'legacy_area_proxy';
-                tipDetails.velocity_scale = max(v_out,1e-8);
-
-            case 'denton_hall_unshrouded_optiona'
-                % Denton/Hall unshrouded tip-clearance loss.
-                % Hall Appendix B gives Phi/(mdot*Vx^2); convert it to the
-                % code convention zeta such that loss = 0.5*zeta*v_out^2.
-                hb = max(span, 1e-6);
-                sigma = chord / max(pitch,1e-8);
-                Cd_leak = field_or(lm.tip,'Cd_leak',0.8);
-                Cs_over_c = field_or(lm.tip,'Cs_over_c',1.0);
-                Cs = Cs_over_c * chord;
-                Vx_row = 0.5*(abs(v_in*cos(chi_in)) + abs(v_out*cos(chi_out)));
-                Vx_row = max(Vx_row, 1e-8);
-
-                [uSS,uPS,x_over_Cs,stagger,modeUsed] = ...
-                    tip_surface_velocity_ratios(rowType, lm.tip, chi_in, chi_out, sigma);
-
-                % Guard against tiny numerical/optimizer excursions outside
-                % the physical domain. If direct velocities are used, this
-                % avoids complex values but does not make bad inputs valid.
-                uSS = max(uSS, 0);
-                uPS = max(uPS, 0);
-                uSS = max(uSS, uPS);
-
-                integrand = uSS .* max(uSS - uPS,0) .* sqrt(max(uSS.^2 - uPS.^2,0));
-                if isscalar(integrand)
-                    I_tip = integrand;
-                else
-                    I_tip = trapz(x_over_Cs, integrand);
-                end
-
-                D_TL = Cd_leak * (gap * Cs)/(hb * chord) * sigma * I_tip;
-                zTL = 2 * D_TL * (Vx_row/max(v_out,1e-8))^2;
-
-                tipDetails = struct('model','denton_hall_unshrouded_optionA', ...
-                    'surface_velocity_mode',modeUsed, ...
-                    'uSS_over_Vx',uSS,'uPS_over_Vx',uPS,'x_over_Cs',x_over_Cs, ...
-                    'stagger_deg',rad2deg(stagger),'solidity',sigma, ...
-                    'D_TL',D_TL,'I_tip',I_tip,'Vx',Vx_row, ...
-                    'velocity_scale',max(v_out,1e-8));
-
-            otherwise
-                error('Unknown tip.model option: %s', lm.tip.model)
-        end
+        hb = max(span, 1e-6);
+        throatFactor = max(cos(chi_in), 0.1);
+        Cd_tip = lm.tip.Cd_tip;
+        zTL = 2 * Cd_tip * gap * chord / (hb * pitch * throatFactor);
     end
 end
 
 zEW = 0;
-endwallDetails = struct('model','none','surface_velocity_mode','none', ...
-    'evaluate_at','none','section_names',{{}},'section_weights',[], ...
-    'uSS_over_Vx',[],'uPS_over_Vx',[],'x_over_Cs',[], ...
-    'stagger_deg',[],'solidity',[],'Cd',NaN,'n_endwalls',NaN, ...
-    'Cs_over_c',NaN,'I_endwall',[],'D_EW',[],'D_EW_total',NaN, ...
-    'Vx',[],'velocity_scale',max(v_out,1e-8));
 if isfield(lm,'endwall')
-    enableEndwall = (strcmpi(rowType,'rotor')  && lm.endwall.enabled_rotor) || ...
-                    (strcmpi(rowType,'stator') && lm.endwall.enabled_stator);
-    if enableEndwall
-        switch lower(field_or(lm.endwall,'model','user_constant'))
-            case 'user_constant'
-                if strcmpi(rowType,'rotor')
-                    zEW = field_or(lm.endwall,'rotor_zeta',0.0);
-                else
-                    zEW = field_or(lm.endwall,'stator_zeta',0.0);
-                end
-                endwallDetails.model = 'user_constant';
-                endwallDetails.evaluate_at = 'mean_combined';
-                endwallDetails.velocity_scale = max(v_out,1e-8);
-
-            case {'hall_denton_cd_baseline','hall_constant_cd','denton_cd'}
-                % Hall/Denton constant-C_D endwall boundary-layer
-                % dissipation only. This is a baseline endwall-wall
-                % friction model; it deliberately excludes secondary-flow,
-                % corner-separation, blockage and tip-vortex interaction
-                % losses.
-                [zEW, endwallDetails] = hall_denton_endwall_loss(rowType, lm, air, span, radial, v_out);
-
-            otherwise
-                error('Unknown endwall.model option: %s', lm.endwall.model)
-        end
+    if strcmpi(rowType,'rotor') && lm.endwall.enabled_rotor
+        zEW = lm.endwall.rotor_zeta;
+    elseif strcmpi(rowType,'stator') && lm.endwall.enabled_stator
+        zEW = lm.endwall.stator_zeta;
     end
 end
 
 row = struct('row_type',rowType, 'profile',zBL, 'trailing_edge',zTE, ...
     'shock',zSW, 'tip',zTL, 'endwall',zEW, ...
-    'shock_details',shockDetails, 'tip_details',tipDetails, 'endwall_details',endwallDetails, ...
     'total',zBL + zTE + zSW + zTL + zEW);
-end
-
-function [uSS,uPS,x_over_Cs,stagger,modeUsed] = tip_surface_velocity_ratios(rowType, tip, chi_in, chi_out, sigma)
-modeUsed = lower(field_or(tip,'surface_velocity_mode','approx'));
-switch modeUsed
-    case 'approx'
-        % Hall Appendix-B option-A approximation:
-        %   uSS - uPS ~= Delta(tan chi)/sigma
-        %   uSS + uPS ~= 2/cos(stagger)
-        % where u = V_surface/Vx.  For the rotor, Delta(tan chi)/sigma is
-        % equivalent to psi/(sigma*phi) when chi are row-relative angles.
-        stagger = tip_stagger_angle(rowType, tip, chi_in, chi_out);
-        uDiff = abs(tan(chi_in) - tan(chi_out)) / max(sigma,1e-8);
-        uSum  = 2 / max(cos(stagger),1e-8);
-        uSS = 0.5*(uSum + uDiff);
-        uPS = 0.5*(uSum - uDiff);
-        x_over_Cs = NaN;
-
-    case 'direct'
-        % Direct values are expected to be normalized by Vx. Scalars give
-        % the algebraic form; vectors give the original chordwise integral.
-        [uSS,uPS,x_over_Cs] = tip_direct_surface_velocities(rowType, tip);
-        if numel(uSS) ~= numel(uPS)
-            error('Direct uSS_over_Vx and uPS_over_Vx must have the same length.')
-        end
-        if isscalar(uSS)
-            x_over_Cs = NaN;
-        elseif any(~isfinite(x_over_Cs))
-            x_over_Cs = linspace(0,1,numel(uSS));
-        end
-        stagger = tip_stagger_angle(rowType, tip, chi_in, chi_out);
-
-    otherwise
-        error('Unknown tip.surface_velocity_mode option: %s', modeUsed)
-end
-end
-
-function stagger = tip_stagger_angle(rowType, tip, chi_in, chi_out)
-switch lower(field_or(tip,'stagger_mode','mean_flow_angles'))
-    case 'mean_flow_angles'
-        % Circular-arc / low-camber first pass: stagger is approximated by
-        % the mean of the inlet and outlet row-frame flow angle magnitudes.
-        stagger = 0.5*(chi_in + chi_out);
-    case 'user'
-        if strcmpi(rowType,'rotor')
-            stagger_deg = field_or(tip,'rotor_stagger_deg',NaN);
-        else
-            stagger_deg = field_or(tip,'stator_stagger_deg',NaN);
-        end
-        if ~isfinite(stagger_deg)
-            error('tip.stagger_mode = user requires a finite row-specific stagger angle.')
-        end
-        stagger = deg2rad(stagger_deg);
-    otherwise
-        error('Unknown tip.stagger_mode option: %s', tip.stagger_mode)
-end
-end
-
-function [uSS,uPS,x_over_Cs] = tip_direct_surface_velocities(rowType, tip)
-if strcmpi(rowType,'rotor')
-    uSS = field_or(tip,'rotor_uSS_over_Vx',NaN);
-    uPS = field_or(tip,'rotor_uPS_over_Vx',NaN);
-    x_over_Cs = field_or(tip,'rotor_x_over_Cs',NaN);
-else
-    uSS = field_or(tip,'stator_uSS_over_Vx',NaN);
-    uPS = field_or(tip,'stator_uPS_over_Vx',NaN);
-    x_over_Cs = field_or(tip,'stator_x_over_Cs',NaN);
-end
-if any(~isfinite(uSS(:))) || any(~isfinite(uPS(:)))
-    error('tip.surface_velocity_mode = direct requires finite uSS_over_Vx and uPS_over_Vx values.')
-end
-uSS = uSS(:).';
-uPS = uPS(:).';
-x_over_Cs = x_over_Cs(:).';
-end
-
-
-function [uSS,uPS,x_over_Cs,stagger,modeUsed] = endwall_surface_velocity_ratios(rowType, lm, chi_in, chi_out, sigma)
-ew = lm.endwall;
-modeUsed = lower(field_or(ew,'surface_velocity_mode','approx'));
-switch modeUsed
-    case 'approx'
-        % Hall Appendix-D baseline: endwall velocity is linearly
-        % interpolated between pressure-side and suction-side velocities.
-        % Without blade-surface data, estimate the two edge velocities from
-        % the same low-camber velocity split used in the Denton/Hall tip
-        % model:
-        %   uSS - uPS ~= Delta(tan chi)/sigma
-        %   uSS + uPS ~= 2/cos(stagger)
-        stagger = endwall_stagger_angle(rowType, ew, chi_in, chi_out);
-        uDiff = abs(tan(chi_in) - tan(chi_out)) / max(sigma,1e-8);
-        uSum  = 2 / max(cos(stagger),1e-8);
-        uSS = 0.5*(uSum + uDiff);
-        uPS = 0.5*(uSum - uDiff);
-        x_over_Cs = NaN;
-
-    case 'direct'
-        % Direct values are expected to be normalized by Vx. Scalars give
-        % the algebraic passage-average form; vectors trigger numerical
-        % integration along x/Cs.
-        [uSS,uPS,x_over_Cs] = endwall_direct_surface_velocities(rowType, ew);
-        if numel(uSS) ~= numel(uPS)
-            error('Direct endwall uSS_over_Vx and uPS_over_Vx must have the same length.')
-        end
-        if isscalar(uSS)
-            x_over_Cs = NaN;
-        elseif any(~isfinite(x_over_Cs))
-            x_over_Cs = linspace(0,1,numel(uSS));
-        end
-        stagger = endwall_stagger_angle(rowType, ew, chi_in, chi_out);
-
-    case 'tip_shared'
-        % Convenience mode: reuse the tip model's surface-velocity settings.
-        % This is useful while the same MULTALL/StageN extraction is used
-        % for both tip leakage and endwall BL loss.
-        if ~isfield(lm,'tip')
-            error('endwall.surface_velocity_mode = tip_shared requires lm.tip to exist.')
-        end
-        [uSS,uPS,x_over_Cs,stagger,tipMode] = ...
-            tip_surface_velocity_ratios(rowType, lm.tip, chi_in, chi_out, sigma);
-        modeUsed = ['tip_shared_' tipMode];
-
-    otherwise
-        error('Unknown endwall.surface_velocity_mode option: %s', modeUsed)
-end
-end
-
-function I_endwall = endwall_velocity_cubed_integral(uSS,uPS,x_over_Cs)
-% Pitchwise mean of u_wall^3 for a linear pressure-side to suction-side
-% interpolation:
-%   u_wall(y) = uPS + y*(uSS-uPS), 0 <= y <= 1.
-% The exact pitchwise average is:
-%   integral_0^1 u_wall^3 dy = (uSS^4-uPS^4)/(4*(uSS-uPS)).
-du = uSS - uPS;
-mean_y = zeros(size(uSS));
-idx = abs(du) > 1e-12;
-mean_y(idx) = (uSS(idx).^4 - uPS(idx).^4) ./ (4*du(idx));
-mean_y(~idx) = uSS(~idx).^3;
-
-if isscalar(mean_y)
-    I_endwall = mean_y;
-else
-    I_endwall = trapz(x_over_Cs, mean_y);
-end
-I_endwall = max(I_endwall, 0);
-end
-
-function stagger = endwall_stagger_angle(rowType, ew, chi_in, chi_out)
-switch lower(field_or(ew,'stagger_mode','mean_flow_angles'))
-    case 'mean_flow_angles'
-        % Low-order first pass: use the mean of inlet and outlet row-frame
-        % flow-angle magnitudes as the representative blade stagger.
-        stagger = 0.5*(chi_in + chi_out);
-    case 'user'
-        if strcmpi(rowType,'rotor')
-            stagger_deg = field_or(ew,'rotor_stagger_deg',NaN);
-        else
-            stagger_deg = field_or(ew,'stator_stagger_deg',NaN);
-        end
-        if ~isfinite(stagger_deg)
-            error('endwall.stagger_mode = user requires a finite row-specific stagger angle.')
-        end
-        stagger = deg2rad(stagger_deg);
-    otherwise
-        error('Unknown endwall.stagger_mode option: %s', ew.stagger_mode)
-end
-end
-
-function [uSS,uPS,x_over_Cs] = endwall_direct_surface_velocities(rowType, ew)
-if strcmpi(rowType,'rotor')
-    uSS = field_or(ew,'rotor_uSS_over_Vx',NaN);
-    uPS = field_or(ew,'rotor_uPS_over_Vx',NaN);
-    x_over_Cs = field_or(ew,'rotor_x_over_Cs',NaN);
-else
-    uSS = field_or(ew,'stator_uSS_over_Vx',NaN);
-    uPS = field_or(ew,'stator_uPS_over_Vx',NaN);
-    x_over_Cs = field_or(ew,'stator_x_over_Cs',NaN);
-end
-if any(~isfinite(uSS(:))) || any(~isfinite(uPS(:)))
-    error('endwall.surface_velocity_mode = direct requires finite uSS_over_Vx and uPS_over_Vx values.')
-end
-uSS = uSS(:).';
-uPS = uPS(:).';
-x_over_Cs = x_over_Cs(:).';
-end
-
-
-function radial = make_radial_row_data(rowType, lm, s, pitch_mean, chord, Tin, Tout)
-% Build hub/mean/tip row data from the current meanline triangles.
-% This is intentionally low-order. Once MEANGEN/STAGEN/MULTALL data are
-% available, these fields can be replaced by section-resolved profiles while
-% keeping the loss-model interfaces unchanged.
-r = [s.rh, s.rm, s.rt];
-names = {'hub','mean','tip'};
-Vx = s.Vx * ones(size(r));
-VthetaMode = 'constant_vtheta';
-if isfield(lm,'radial')
-    VthetaMode = field_or(lm.radial,'vtheta_mode','constant_vtheta');
-end
-pitchMode = 'scale_with_radius';
-if isfield(lm,'radial')
-    pitchMode = field_or(lm.radial,'pitch_mode','scale_with_radius');
-end
-
-switch lower(rowType)
-    case 'rotor'
-        Vt_in  = spanwise_vtheta(s.Vt1, r, s.rm, VthetaMode);
-        Vt_out = spanwise_vtheta(s.Vt2, r, s.rm, VthetaMode);
-        U = s.omega .* r;
-        Wt_in = Vt_in - U;
-        Wt_out = Vt_out - U;
-        v_in = hypot(Vx, Wt_in);
-        v_out = hypot(Vx, Wt_out);
-        chi_in_signed = atan2(Wt_in, Vx);
-        chi_out_signed = atan2(Wt_out, Vx);
-
-    case 'stator'
-        Vt_in  = spanwise_vtheta(s.Vt2, r, s.rm, VthetaMode);
-        Vt_out = spanwise_vtheta(s.Vt3, r, s.rm, VthetaMode);
-        U = zeros(size(r));
-        v_in = hypot(Vx, Vt_in);
-        v_out = hypot(Vx, Vt_out);
-        chi_in_signed = atan2(Vt_in, Vx);
-        chi_out_signed = atan2(Vt_out, Vx);
-
-    otherwise
-        error('Unknown rowType: %s', rowType)
-end
-
-switch lower(pitchMode)
-    case 'scale_with_radius'
-        pitch = pitch_mean .* r ./ max(s.rm,1e-8);
-    case 'constant'
-        pitch = pitch_mean .* ones(size(r));
-    otherwise
-        error('Unknown loss_model.radial.pitch_mode: %s', pitchMode)
-end
-
-Min = v_in ./ sqrt(s.air.gamma*s.air.R*Tin);
-Mout = v_out ./ sqrt(s.air.gamma*s.air.R*Tout);
-radial = struct('row_type',rowType,'names',{names},'r',r,'Vx',Vx,'U',U, ...
-    'pitch',pitch,'chord',chord.*ones(size(r)), ...
-    'chi_in_signed',chi_in_signed,'chi_out_signed',chi_out_signed, ...
-    'chi_in',abs(chi_in_signed),'chi_out',abs(chi_out_signed), ...
-    'v_in',v_in,'v_out',v_out,'Min',Min,'Mout',Mout, ...
-    'Tin',Tin.*ones(size(r)),'Tout',Tout.*ones(size(r)));
-end
-
-function Vt = spanwise_vtheta(Vt_mean, r, rm, mode)
-switch lower(mode)
-    case {'constant_vtheta','constant'}
-        Vt = Vt_mean .* ones(size(r));
-    case {'free_vortex','constant_rvtheta'}
-        Vt = Vt_mean .* rm ./ max(r,1e-8);
-    otherwise
-        error('Unknown spanwise vtheta mode: %s', mode)
-end
-end
-
-function [idx,weights,mode] = select_section_indices(settings, rowType, defaultMode)
-if strcmpi(rowType,'rotor')
-    mode = field_or(settings,'rotor_evaluate_at',field_or(settings,'evaluate_at',defaultMode));
-else
-    mode = field_or(settings,'stator_evaluate_at',field_or(settings,'evaluate_at',defaultMode));
-end
-mode = lower(mode);
-switch mode
-    case 'hub'
-        idx = 1; weights = 1;
-    case {'mean','meanline'}
-        idx = 2; weights = 1;
-    case {'tip','casing'}
-        idx = 3; weights = 1;
-    case {'hub_tip','endwalls'}
-        idx = [1 3]; weights = [0.5 0.5];
-    case {'hub_mean_tip','all','spanwise'}
-        idx = [1 2 3]; weights = [0.25 0.5 0.25];
-    case {'mean_combined','legacy_mean'}
-        idx = 2; weights = 1;
-    otherwise
-        error('Unknown evaluate_at option: %s', mode)
-end
-end
-
-function [zSW, details] = koch_smith_shock_loss(rowType, shock, air, radial, v_out_mean)
-% Koch & Smith shock loss model for axial-flow compressors.
-% Separates shock loss into leading-edge bluntness entropy rise and passage
-% shock entropy rise. The passage shock is represented as one oblique shock
-% that reduces a representative passage inlet Mach number to unity, or to
-% the exit Mach number if the exit Mach number is supersonic.
-[idx,weights,mode] = select_section_indices(shock, rowType, 'tip');
-if strcmpi(rowType,'stator') && ~field_or(shock,'enabled_stator',false)
-    zSW = 0;
-    details = empty_koch_smith_details('koch_smith_le_and_passage',mode,max(v_out_mean,1e-8));
-    return
-end
-if strcmpi(rowType,'rotor') && ~field_or(shock,'enabled_rotor',true)
-    zSW = 0;
-    details = empty_koch_smith_details('koch_smith_le_and_passage',mode,max(v_out_mean,1e-8));
-    return
-end
-
-n = numel(idx);
-hLoss = zeros(1,n); zeta_i = zeros(1,n);
-M1v = zeros(1,n); Moutv = zeros(1,n); Mssv = NaN(1,n); Mrepv = NaN(1,n); Mtargetv = NaN(1,n);
-betaDeg = zeros(1,n); tlePitch = zeros(1,n);
-dsLE = zeros(1,n); dsPass = zeros(1,n); dsTot = zeros(1,n);
-p02p01Pass = ones(1,n); Mn1Pass = NaN(1,n); M2Pass = NaN(1,n);
-status = cell(1,n); sectionNames = cell(1,n);
-MssModeUsed = cell(1,n);
-
-useLE = field_or(shock,'use_le_bluntness',true);
-usePassage = field_or(shock,'use_passage_shock',true);
-Mmin = field_or(shock,'M_crit',field_or(shock,'M1_rel_min',1.0));
-ksWeight = field_or(shock,'Mss_weight',6.0);
-
-for k = 1:n
-    j = idx(k);
-    sectionNames{k} = radial.names{j};
-    M1 = radial.Min(j);
-    Mout = radial.Mout(j);
-    beta1 = radial.chi_in(j);
-    tLE_over_pitch = koch_smith_tLE_over_pitch(rowType, shock, radial, j);
-
-    M1v(k) = M1;
-    Moutv(k) = Mout;
-    betaDeg(k) = rad2deg(beta1);
-    tlePitch(k) = tLE_over_pitch;
-    status{k} = 'no_shock';
-
-    if useLE && M1 > Mmin
-        machTerm = 1.28*(M1 - 1) + 0.96*(M1 - 1)^2;
-        arg = 1 - (tLE_over_pitch/max(cos(beta1),1e-8))*machTerm;
-        if arg <= 0
-            arg = eps;
-            status{k} = 'le_log_argument_clipped';
-        else
-            status{k} = 'le_bluntness';
-        end
-        dsLE(k) = max(-log(arg),0);
-    end
-
-    if usePassage
-        [Mss, modeUsed] = koch_smith_surface_mach(rowType, shock, air, radial, j);
-        Mssv(k) = Mss;
-        MssModeUsed{k} = modeUsed;
-        if isfinite(Mss)
-            Mrep = (ksWeight*Mss + M1)/max(ksWeight + 1,1e-8);
-        else
-            Mrep = M1;
-        end
-        Mrepv(k) = Mrep;
-
-        if Mout > 1
-            Mtarget = Mout;
-        else
-            Mtarget = 1.0;
-        end
-        Mtargetv(k) = Mtarget;
-
-        if Mrep > max(Mtarget,Mmin)
-            [dsR,p02p01,Mn1,M2actual,ok] = oblique_shock_entropy_to_target(Mrep, Mtarget, air.gamma);
-            dsPass(k) = max(dsR,0);
-            p02p01Pass(k) = p02p01;
-            Mn1Pass(k) = Mn1;
-            M2Pass(k) = M2actual;
-            if ok
-                if strcmp(status{k},'no_shock')
-                    status{k} = 'passage_shock';
-                else
-                    status{k} = [status{k} '+passage_shock'];
-                end
-            else
-                if strcmp(status{k},'no_shock')
-                    status{k} = 'passage_normal_shock_fallback';
-                else
-                    status{k} = [status{k} '+passage_normal_shock_fallback'];
-                end
-            end
-        end
-    else
-        Mssv(k) = NaN;
-        Mrepv(k) = M1;
-        Mtargetv(k) = max(1.0,Mout);
-        MssModeUsed{k} = 'disabled';
-    end
-
-    dsTot(k) = dsLE(k) + dsPass(k);
-    if dsTot(k) > 0
-        Tref = koch_smith_temperature_reference(shock, radial, j, Mssv(k), air);
-        hLoss(k) = Tref * air.R * dsTot(k);
-        zeta_i(k) = 2*hLoss(k)/max(v_out_mean,1e-8)^2;
-    end
-end
-
-hLossWeighted = sum(weights .* hLoss);
-zSW = 2*hLossWeighted/max(v_out_mean,1e-8)^2;
-
-if n == 1
-    MssMode = MssModeUsed{1};
-else
-    MssMode = strjoin(MssModeUsed, ',');
-end
-
-details = struct('model','koch_smith_le_and_passage','evaluate_at',mode, ...
-    'section_names',{sectionNames},'section_weights',weights, ...
-    'M1',M1v,'Mout',Moutv,'Mss_max',Mssv,'Mrep',Mrepv,'Mtarget',Mtargetv, ...
-    'beta1_deg',betaDeg,'tLE_over_pitch',tlePitch, ...
-    'ds_le_over_R',dsLE,'ds_passage_over_R',dsPass,'ds_over_R',dsTot, ...
-    'h_loss',hLoss,'zeta_sections',zeta_i, ...
-    'passage_p02_over_p01',p02p01Pass,'passage_Mn1',Mn1Pass, ...
-    'passage_M2_actual',M2Pass,'status',{status}, ...
-    'Mss_mode',MssMode,'velocity_scale',max(v_out_mean,1e-8));
-end
-
-function details = empty_koch_smith_details(model,mode,vscale)
-details = struct('model',model,'evaluate_at',mode, ...
-    'section_names',{{}},'section_weights',[],'M1',[],'Mout',[], ...
-    'Mss_max',[],'Mrep',[],'Mtarget',[],'beta1_deg',[], ...
-    'tLE_over_pitch',[],'ds_le_over_R',[],'ds_passage_over_R',[], ...
-    'ds_over_R',[],'h_loss',[],'zeta_sections',[], ...
-    'passage_p02_over_p01',[],'passage_Mn1',[],'passage_M2_actual',[], ...
-    'status',{{}},'Mss_mode','none','velocity_scale',vscale);
-end
-
-function tLE_over_pitch = koch_smith_tLE_over_pitch(rowType, shock, radial, idx)
-names = {'hub','mean','tip'};
-suffix = names{idx};
-row = lower(rowType);
-tLE_over_pitch = field_or(shock,[row '_tLE_over_pitch_' suffix],NaN);
-if ~isfinite(tLE_over_pitch)
-    tLE_over_pitch = field_or(shock,[row '_tLE_over_pitch'],NaN);
-end
-if ~isfinite(tLE_over_pitch)
-    tLE_over_pitch = field_or(shock,'tLE_over_pitch',NaN);
-end
-if ~isfinite(tLE_over_pitch)
-    tLE_over_chord = field_or(shock,[row '_tLE_over_chord_' suffix],NaN);
-    if ~isfinite(tLE_over_chord)
-        tLE_over_chord = field_or(shock,[row '_tLE_over_chord'],field_or(shock,'tLE_over_chord',0.008));
-    end
-    tLE_over_pitch = tLE_over_chord * radial.chord(idx)/max(radial.pitch(idx),1e-8);
-end
-tLE_over_pitch = max(tLE_over_pitch,0);
-end
-
-function [Mss, modeUsed] = koch_smith_surface_mach(rowType, shock, air, radial, idx)
-mode = lower(field_or(shock,'Mss_mode',field_or(shock,'surface_mach_mode','estimated')));
-row = lower(rowType);
-suffix = radial.names{idx};
-M1 = radial.Min(idx);
-modeUsed = mode;
-
-switch mode
-    case {'direct','user','direct_sections','user_sections'}
-        Mss = field_or(shock,[row '_Mss_max_' suffix],NaN);
-        if ~isfinite(Mss)
-            Mss = field_or(shock,[row '_Mss_max'],field_or(shock,'Mss_max',NaN));
-        end
-        if ~isfinite(Mss)
-            [Mss, modeUsed] = koch_smith_surface_mach_estimated(rowType, shock, air, radial, idx);
-            modeUsed = ['direct_missing_' modeUsed];
-        end
-
-    case {'factor','multiplier'}
-        fac = field_or(shock,[row '_Mss_factor'],field_or(shock,'Mss_factor',1.0));
-        Mss = fac*M1;
-
-    case {'estimated','estimate','surface_velocity_estimate','velocity_split'}
-        [Mss, modeUsed] = koch_smith_surface_mach_estimated(rowType, shock, air, radial, idx);
-
-    otherwise
-        error('Unknown shock.Mss_mode option: %s', mode)
-end
-Mss = max(Mss,0);
-end
-
-function [Mss, modeUsed] = koch_smith_surface_mach_estimated(rowType, shock, air, radial, idx)
-chi_in = radial.chi_in(idx);
-chi_out = radial.chi_out(idx);
-sigma = radial.chord(idx)/max(radial.pitch(idx),1e-8);
-stagger = shock_stagger_angle(rowType, shock, radial, idx, chi_in, chi_out);
-uDiff = abs(tan(chi_in) - tan(chi_out)) / max(sigma,1e-8);
-uSum  = 2 / max(cos(stagger),1e-8);
-uSS = max(0.5*(uSum + uDiff),0);
-Wss = uSS * max(abs(radial.Vx(idx)),1e-8);
-T0rel = radial.Tin(idx) + radial.v_in(idx)^2/(2*air.cp);
-Tss = T0rel - Wss^2/(2*air.cp);
-if Tss <= 1
-    Tss = 1;
-end
-Mss = Wss/sqrt(air.gamma*air.R*Tss);
-modeUsed = 'estimated_velocity_split';
-end
-
-function stagger = shock_stagger_angle(rowType, shock, radial, idx, chi_in, chi_out)
-mode = lower(field_or(shock,'stagger_mode','mean_flow_angles'));
-row = lower(rowType);
-suffix = radial.names{idx};
-switch mode
-    case 'mean_flow_angles'
-        stagger = 0.5*(chi_in + chi_out);
-    case {'user','user_sections','sectional'}
-        staggerDeg = field_or(shock,[row '_stagger_' suffix '_deg'],NaN);
-        if ~isfinite(staggerDeg)
-            staggerDeg = field_or(shock,[row '_stagger_deg'],NaN);
-        end
-        if ~isfinite(staggerDeg)
-            error('shock.stagger_mode = user requires row-specific or section-specific stagger angle.')
-        end
-        stagger = deg2rad(staggerDeg);
-    otherwise
-        error('Unknown shock.stagger_mode option: %s', mode)
-end
-stagger = min(max(abs(stagger),deg2rad(1e-6)),deg2rad(89.9));
-end
-
-function Tref = koch_smith_temperature_reference(shock, radial, idx, Mss, air)
-mode = lower(field_or(shock,'temperature_reference','inlet_static'));
-switch mode
-    case 'inlet_static'
-        Tref = radial.Tin(idx);
-    case 'mean_static'
-        Tref = 0.5*(radial.Tin(idx) + radial.Tout(idx));
-    case 'surface_static'
-        if isfinite(Mss) && Mss > 0
-            T0rel = radial.Tin(idx) + radial.v_in(idx)^2/(2*air.cp);
-            Tref = T0rel/(1 + 0.5*(air.gamma-1)*Mss^2);
-        else
-            Tref = radial.Tin(idx);
-        end
-    otherwise
-        error('Unknown shock.temperature_reference option: %s', mode)
-end
-Tref = max(Tref,1);
-end
-
-function [dsR,p02_p01,Mn1,M2actual,ok] = oblique_shock_entropy_to_target(M1, Mtarget, gamma)
-ok = true;
-dsR = 0; p02_p01 = 1; Mn1 = NaN; M2actual = M1;
-if M1 <= 1 || Mtarget >= M1
-    return
-end
-
-[M2normal,p02normal] = normal_shock_downstream_total_mach_and_p02(M1, gamma);
-if Mtarget <= M2normal
-    Mn1 = M1;
-    M2actual = M2normal;
-    p02_p01 = p02normal;
-    dsR = -log(max(p02_p01,eps));
-    ok = false;
-    return
-end
-
-f = @(mn) oblique_downstream_mach(M1, mn, gamma) - Mtarget;
-lo = 1 + 1e-8;
-hi = M1;
-try
-    Mn1 = fzero(f, [lo hi]);
-catch
-    a = lo; b = hi;
-    fa = f(a); fb = f(b);
-    if fa*fb > 0
-        Mn1 = M1;
-        ok = false;
-    else
-        for it = 1:80
-            c = 0.5*(a+b);
-            fc = f(c);
-            if abs(fc) < 1e-10
-                a = c; b = c; break
-            end
-            if fa*fc <= 0
-                b = c; fb = fc;
-            else
-                a = c; fa = fc;
-            end
-        end
-        Mn1 = 0.5*(a+b);
-    end
-end
-M2actual = oblique_downstream_mach(M1, Mn1, gamma);
-p02_p01 = normal_shock_total_pressure_ratio(Mn1, gamma);
-dsR = -log(max(p02_p01,eps));
-end
-
-function M2 = oblique_downstream_mach(M1, Mn1, gamma)
-Mn1 = min(max(Mn1,1+1e-10),M1);
-Vt1_over_a1 = sqrt(max(M1^2 - Mn1^2,0));
-Mn2 = normal_shock_downstream_mach_from_Mn(Mn1, gamma);
-[~,~,T2_T1] = normal_shock_static_ratios(Mn1, gamma);
-M2 = sqrt(Mn2^2 + Vt1_over_a1^2/max(T2_T1,1e-12));
-end
-
-function [M2,p02_p01] = normal_shock_downstream_total_mach_and_p02(M1, gamma)
-M2 = normal_shock_downstream_mach_from_Mn(M1, gamma);
-p02_p01 = normal_shock_total_pressure_ratio(M1, gamma);
-end
-
-function M2 = normal_shock_downstream_mach_from_Mn(Mn1, gamma)
-M2 = sqrt((1 + 0.5*(gamma-1)*Mn1^2)/(gamma*Mn1^2 - 0.5*(gamma-1)));
-end
-
-function p02_p01 = normal_shock_total_pressure_ratio(Mn1, gamma)
-[p2_p1,~,~] = normal_shock_static_ratios(Mn1, gamma);
-Mn2 = normal_shock_downstream_mach_from_Mn(Mn1, gamma);
-A1 = 1 + 0.5*(gamma-1)*Mn1^2;
-A2 = 1 + 0.5*(gamma-1)*Mn2^2;
-p02_p01 = p2_p1 * (A2/A1)^(gamma/(gamma-1));
-p02_p01 = min(max(p02_p01,eps),1.0);
-end
-
-function [p2_p1,rho2_rho1,T2_T1] = normal_shock_static_ratios(Mn1, gamma)
-p2_p1 = 1 + 2*gamma/(gamma+1)*(Mn1^2 - 1);
-rho2_rho1 = ((gamma+1)*Mn1^2)/(2 + (gamma-1)*Mn1^2);
-T2_T1 = p2_p1/rho2_rho1;
-end
-
-function [zEW, details] = hall_denton_endwall_loss(rowType, lm, air, span, radial, v_out_mean)
-ew = lm.endwall;
-[idx,weights,mode] = select_section_indices(ew, rowType, 'hub_tip');
-if strcmpi(mode,'mean_combined') || strcmpi(mode,'legacy_mean')
-    nEndwallsDefault = 2;
-else
-    nEndwallsDefault = 1;
-end
-
-n = numel(idx);
-Cd_ew = field_or(ew,'Cd',0.002);
-Cs_over_c = field_or(ew,'Cs_over_c',1.0);
-sectionNames = cell(1,n);
-D = zeros(1,n); I = zeros(1,n); VxVals = zeros(1,n); sigVals = zeros(1,n);
-staggerDeg = zeros(1,n); nEnd = zeros(1,n);
-uSS_store = cell(1,n); uPS_store = cell(1,n); x_store = cell(1,n);
-for k = 1:n
-    j = idx(k);
-    sectionNames{k} = radial.names{j};
-    pitch_j = radial.pitch(j);
-    chord_j = radial.chord(j);
-    sigma = chord_j/max(pitch_j,1e-8);
-    Cs = Cs_over_c * chord_j;
-    Vx_row = max(abs(radial.Vx(j)),1e-8);
-
-    [uSS,uPS,x_over_Cs,stagger,modeEW] = ...
-        endwall_surface_velocity_ratios(rowType, lm, radial.chi_in(j), radial.chi_out(j), sigma);
-    uSS = max(uSS, 0);
-    uPS = max(uPS, 0);
-    I_endwall = endwall_velocity_cubed_integral(uSS, uPS, x_over_Cs);
-
-    if strcmpi(mode,'mean_combined') || strcmpi(mode,'legacy_mean')
-        if strcmpi(rowType,'rotor')
-            nLocal = field_or(ew,'rotor_n_endwalls',field_or(ew,'n_endwalls',2));
-        else
-            nLocal = field_or(ew,'stator_n_endwalls',field_or(ew,'n_endwalls',2));
-        end
-    else
-        nLocal = nEndwallsDefault;
-    end
-
-    D(k) = Cd_ew * nLocal * (Cs/max(span,1e-8)) * Vx_row^2 * I_endwall;
-    I(k) = I_endwall;
-    VxVals(k) = Vx_row;
-    sigVals(k) = sigma;
-    staggerDeg(k) = rad2deg(stagger);
-    nEnd(k) = nLocal;
-    uSS_store{k} = uSS;
-    uPS_store{k} = uPS;
-    x_store{k} = x_over_Cs;
-end
-
-% If both actual endwalls are selected, sum the hub and casing losses. If a
-% spanwise diagnostic mode is selected, use the provided integration weights.
-if strcmpi(mode,'hub_tip') || strcmpi(mode,'endwalls')
-    Dtotal = sum(D);
-else
-    Dtotal = sum(weights .* D);
-end
-zEW = 2*Dtotal/max(v_out_mean,1e-8)^2;
-details = struct('model','hall_denton_cd_baseline', ...
-    'surface_velocity_mode',field_or(ew,'surface_velocity_mode','approx'), ...
-    'evaluate_at',mode,'section_names',{sectionNames},'section_weights',weights, ...
-    'uSS_over_Vx',{uSS_store},'uPS_over_Vx',{uPS_store},'x_over_Cs',{x_store}, ...
-    'stagger_deg',staggerDeg,'solidity',sigVals, ...
-    'Cd',Cd_ew,'n_endwalls',nEnd,'Cs_over_c',Cs_over_c, ...
-    'I_endwall',I,'D_EW',D,'D_EW_total',Dtotal, ...
-    'Vx',VxVals,'velocity_scale',max(v_out_mean,1e-8));
-end
-
-function val = field_or(s, name, defaultVal)
-if isfield(s,name)
-    val = s.(name);
-else
-    val = defaultVal;
-end
 end
 
 function out = make_loss_struct(zR, zS, typeLabel, note, breakdown)

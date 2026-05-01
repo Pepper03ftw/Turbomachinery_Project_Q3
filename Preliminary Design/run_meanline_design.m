@@ -40,6 +40,18 @@ fprintf('Rotor : DF = %.3f, limit = %.3f, residual = %+ .3f --> %s\n', ...
 fprintf('Stator: DF = %.3f, limit = %.3f, residual = %+ .3f --> %s\n', ...
     out.diffusion.stator_lieblein, out.diffusion.limit, out.diffusion.stator_residual, passfail(out.diffusion.stator_ok));
 
+fprintf('\nLieblein optimum incidence/deviation estimates\n')
+if isfield(out,'lieblein') && isfield(out.lieblein,'enabled') && out.lieblein.enabled
+    print_lieblein_row('Rotor ', out.lieblein.rotor);
+    print_lieblein_row('Stator', out.lieblein.stator);
+else
+    if isfield(out,'lieblein') && isfield(out.lieblein,'error')
+        fprintf('Lieblein evaluation unavailable: %s\n', out.lieblein.error);
+    else
+        fprintf('Lieblein evaluation disabled.\n');
+    end
+end
+
 fprintf('\nConstraint residual vector c <= 0\n')
 fprintf('  Howell rotor  [deg] : %+ .4f\n', out.constraints.residuals.howell_rotor_deg);
 fprintf('  Howell stator [deg] : %+ .4f\n', out.constraints.residuals.howell_stator_deg);
@@ -159,6 +171,16 @@ if tf
     s = 'PASS';
 else
     s = 'FAIL';
+end
+end
+
+function print_lieblein_row(label, r)
+if r.valid
+    fprintf('%s: sigma = %.3f, t/c = %.4f, i = %+ .3f deg, delta = %+ .3f deg, camber = %.3f deg, stagger = %.3f deg\n', ...
+        label, r.sigma, r.tmax_over_c, r.incidence_deg, r.deviation_deg, r.camber_deg, r.stagger_deg);
+else
+    fprintf('%s: invalid or outside digitized chart range. beta_in = %.3f deg, sigma = %.3f, t/c = %.4f\n', ...
+        label, r.chi_in_deg, r.sigma, r.tmax_over_c);
 end
 end
 
