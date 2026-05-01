@@ -124,7 +124,7 @@ in.loss_model.trailing_edge.dstar_over_s = 0.0; % only used if use_bl_terms = tr
 %                                 Mach number.
 in.loss_model.shock.enabled = true;
 in.loss_model.shock.enabled_rotor = true;
-in.loss_model.shock.enabled_stator = true;    % switch on only if stator shocks are expected
+in.loss_model.shock.enabled_stator = false;    % switch on only if stator shocks are expected
 in.loss_model.shock.model = 'koch_smith_le_and_passage';
 in.loss_model.shock.M_crit = 1.0;              % LE bluntness active for M1 > M_crit
 
