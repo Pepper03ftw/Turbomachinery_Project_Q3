@@ -6,6 +6,16 @@ function howell = read_howell_curves(paths)
 %   howell.f_beta2(beta2_deg)
 %   howell.Phi_Re(Re_over_1e5)
 %   howell.Psi_sc(s_over_c)
+%
+% The data are cached persistently. In a duty-coefficient sweep this avoids
+% re-reading the same CSV files thousands of times.
+
+persistent cache_key cache_howell
+key = make_howell_key(paths);
+if ~isempty(cache_key) && strcmp(cache_key,key)
+    howell = cache_howell;
+    return
+end
 
 fb = read_two_col(paths.f_beta2);
 pr = read_two_col(paths.Phi_Re);
@@ -23,6 +33,14 @@ howell.Psi_sc  = @(x) interp_clamped(ps(:,1), ps(:,2), x);
 howell.raw.f_beta2 = fb;
 howell.raw.Phi_Re  = pr;
 howell.raw.Psi_sc  = ps;
+howell.files = paths;
+
+cache_key = key;
+cache_howell = howell;
+end
+
+function key = make_howell_key(paths)
+key = [char(paths.f_beta2) '|' char(paths.Phi_Re) '|' char(paths.Psi_sc)];
 end
 
 function xy = read_two_col(file)

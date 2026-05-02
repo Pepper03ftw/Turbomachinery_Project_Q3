@@ -23,6 +23,13 @@ files.m_NACA65    = get_path(paths,'m_NACA65','lieblein_m_NACA65.csv');
 files.Kdelta_t    = get_path(paths,'Kdelta_t','lieblein_Kdelta_t.csv');
 files.b           = get_path(paths,'b','lieblein_b.csv');
 
+persistent cache_key cache_curves
+key = make_lieblein_key(files);
+if ~isempty(cache_key) && strcmp(cache_key,key)
+    curves = cache_curves;
+    return
+end
+
 T_i0 = readtable(files.i0_10);
 T_n  = readtable(files.n);
 T_Ki = readtable(files.Ki_t);
@@ -58,6 +65,9 @@ curves.ranges = struct( ...
     'm_beta',[min(T_m.beta1_deg) max(T_m.beta1_deg)], ...
     'b_beta',[min(T_b.beta1_deg) max(T_b.beta1_deg)]);
 
+cache_key = key;
+cache_curves = curves;
+
     function p = get_path(s, field, default_name)
         if isfield(s,field) && ~isempty(s.(field))
             p = s.(field);
@@ -74,6 +84,12 @@ curves.ranges = struct( ...
             end
         end
     end
+end
+
+function key = make_lieblein_key(files)
+key = [char(files.i0_10) '|' char(files.n) '|' char(files.Ki_t) '|' ...
+       char(files.delta0_10) '|' char(files.m_NACA65) '|' ...
+       char(files.Kdelta_t) '|' char(files.b)];
 end
 
 function v = interp2_no_extrap(F, beta1_deg, sigma)
