@@ -25,7 +25,8 @@ status_msg(in,'START','meanline_fan_design entered');
 
 % Recommended mode for this project chat: sweep phi, psi, and R inside the
 % hard course limits while holding the project operating point as constraints.
-if strcmpi(in.design.solve_mode,'sweep_project_constraints') && ...
+if (strcmpi(in.design.solve_mode,'sweep_project_constraints') || ...
+        strcmpi(in.design.solve_mode,'sweep_fixed_mean_radius_duty')) && ...
         ~field_or(in.design,'sweep_active',false)
     out = meanline_design_sweep_project(in);
     return
@@ -36,7 +37,8 @@ end
 if isfield(in,'design') && isfield(in.design,'beta_tt_mode') && ...
         strcmpi(in.design.beta_tt_mode,'auto_within_range') && ...
         ~strcmpi(in.design.solve_mode,'project_fixed_candidate') && ...
-        ~strcmpi(in.design.solve_mode,'sweep_project_constraints')
+        ~strcmpi(in.design.solve_mode,'sweep_project_constraints') && ...
+        ~strcmpi(in.design.solve_mode,'sweep_fixed_mean_radius_duty')
 
     if ~isfield(in.design,'beta_tt_search_active') || ~in.design.beta_tt_search_active
         out = meanline_design_auto_beta_tt(in);
@@ -47,7 +49,8 @@ end
 if isfield(in,'design') && isfield(in.design,'R_mode') && ...
         strcmpi(in.design.R_mode,'auto_balance_DF_Howell') && ...
         ~strcmpi(in.design.solve_mode,'project_fixed_candidate') && ...
-        ~strcmpi(in.design.solve_mode,'sweep_project_constraints')
+        ~strcmpi(in.design.solve_mode,'sweep_project_constraints') && ...
+        ~strcmpi(in.design.solve_mode,'sweep_fixed_mean_radius_duty')
 
     if ~isfield(in.design,'R_search_active') || ~in.design.R_search_active
         out = meanline_design_auto_R(in);
@@ -76,28 +79,92 @@ status_msg(in,'1/12','geometry and continuity');
 a01 = sqrt(air.gamma*air.R*T01);
 T02s_target = T01 * in.beta_tt_target.^((air.gamma-1)/air.gamma);
 w_is_target = air.cp*(T02s_target - T01);
+fixed_radius_duty_active = false;
 
 switch lower(in.design.solve_mode)
-    case {'project_fixed_candidate','sweep_project_constraints'}
-        % Candidate-evaluation mode. Mx is kept at the fan face. The trial
-        % phi defines Umean and therefore the mean radius. The prescribed
-        % hub-to-tip ratio then defines the annulus. The fixed quantities
-        % mdot and Mrel_tip are not silently forced by changing geometry;
-        % instead they are evaluated as constraints with the requested
-        % project tolerance.
+    case {'project_fixed_candidate','sweep_project_constraints','sweep_fixed_mean_radius_duty'}
+        % Candidate-evaluation mode for the project workflow. Two geometrical
+        % closures are supported here:
+        %   1) continuity-first: Mx, mdot and hub-to-tip define r_m and phi is computed;
+        %   2) fixed-mean-radius duty sweep: r_m is supplied/chosen and phi is swept.
+        % The second option mirrors the MEANGEN input philosophy where mean
+        % radius/diameter and the duty coefficients are the main preliminary
+        % quantities to pass downstream.
+        fixed_radius_duty_active = field_or(in.design,'fixed_mean_radius_duty_active',false) || ...
+            strcmpi(field_or(in.design,'solve_mode',''),'sweep_fixed_mean_radius_duty');
+
+        % Continuity reference at the project axial Mach.  This is always
+        % computed as a diagnostic, even when a separate fixed radius is used.
         Mx_target = in.Mx_design;
-        [T1,p1,rho1,Vx] = inlet_static_from_Mx(T01,p01,Mx_target,air);
+        [T1_ref,p1_ref,rho1_ref,Vx_ref] = inlet_static_from_Mx(T01,p01,Mx_target,air); %#ok<ASGLU>
+        A1_continuity = in.mdot/(rho1_ref*Vx_ref);
+        [rt_continuity,rh_continuity] = radii_from_area_and_ratio(A1_continuity, in.hub_to_tip);
+        rm_continuity = mean_radius_from_rule(rt_continuity, rh_continuity, in.design.mean_radius_rule);
 
-        phi_used = phi_initial;
-        U = Vx/max(phi_used,1e-12);
-        rm = U/omega;
-        [rt,rh] = radii_from_mean_and_ratio(rm, in.hub_to_tip, in.design.mean_radius_rule);
-        A1 = pi*(rt^2-rh^2);
-        phi_actual = Vx/U;
+        tipmach_radius_match = struct('enabled',false, ...
+            'status','disabled', ...
+            'rm_continuity',rm_continuity, ...
+            'rt_continuity',rt_continuity, ...
+            'rh_continuity',rh_continuity, ...
+            'A1_continuity',A1_continuity, ...
+            'rm_selected',rm_continuity, ...
+            'relative_shift',0, ...
+            'Mrel_tip_target',in.Mrel_tip_design, ...
+            'Mrel_tip_selected',NaN);
 
-        geometry_mode_note = ['Project-constrained candidate: Mx sets Vx, ', ...
-            'trial phi sets mean radius, and hub-to-tip ratio sets annulus. ', ...
-            'mdot and Mrel_tip are checked as constraints, not hidden geometry fixes.'];
+        if fixed_radius_duty_active
+            rm_user = field_or(in.design,'fixed_mean_radius_m',NaN);
+            if isfinite(rm_user) && rm_user > 0
+                rm = rm_user;
+                rm_source = 'user_fixed_mean_radius_m';
+            else
+                scale = field_or(in.design,'fixed_mean_radius_scale',1.0);
+                rm = scale*rm_continuity;
+                rm_source = sprintf('continuity_reference_scaled_by_%.4g',scale);
+            end
+            [rt,rh] = radii_from_mean_and_ratio(rm, in.hub_to_tip, in.design.mean_radius_rule);
+            A1 = pi*(rt^2 - rh^2);
+
+            phi_used = phi_initial;
+            Vx = phi_used * omega * rm;
+            [T1,p1,rho1] = inlet_static_from_Vx(T01,p01,Vx,air);
+            phi_actual = phi_used;
+
+            tipmach_radius_match.status = 'not_used_fixed_mean_radius_duty_sweep';
+            tipmach_radius_match.rm_selected = rm;
+            tipmach_radius_match.relative_shift = (rm-rm_continuity)/max(rm_continuity,1e-12);
+
+            geometry_mode_note = ['Fixed-mean-radius duty sweep: r_m is fixed from ',rm_source, ...
+                ', hub-to-tip sets rt/rh, and phi is swept by setting Vx = phi*Omega*r_m. ', ...
+                'Continuity mdot is reported as a diagnostic rather than used to resize the annulus.'];
+        else
+            % Continuity-first project closure.  The project point fixes Mx,
+            % mdot and hub-to-tip ratio, so continuity fixes the annulus area
+            % and therefore the mean radius.  Phi is an output/check.
+            T1 = T1_ref; p1 = p1_ref; rho1 = rho1_ref; Vx = Vx_ref;
+            A1 = A1_continuity;
+            rt = rt_continuity; rh = rh_continuity; rm = rm_continuity;
+
+            if field_or(in.design,'match_Mrel_tip_by_mean_radius',false)
+                alpha1_mode_for_match = field_or(in.design,'alpha1_mode_active',field_or(in.design,'alpha1_mode','free'));
+                [rt,rh,rm,A1,tipmach_radius_match] = match_radius_to_tip_mach( ...
+                    rm_continuity, in.hub_to_tip, in.design.mean_radius_rule, ...
+                    Vx, T1, air, omega, psi, R, alpha1_mode_for_match, ...
+                    field_or(in.design,'alpha1_deg',0), in.Mrel_tip_design, ...
+                    in.loss_model.radial.vtheta_mode, in.design);
+            end
+
+            U = omega*rm;
+            phi_used = Vx/max(U,1e-12);
+            phi_actual = phi_used;
+
+            geometry_mode_note = ['Continuity-fixed project candidate: Mx sets Vx and density, ', ...
+                'mdot gives the reference annulus/r_m, and hub-to-tip ratio sets rt/rh. ', ...
+                'Phi is computed, not swept.'];
+            if field_or(in.design,'match_Mrel_tip_by_mean_radius',false)
+                geometry_mode_note = [geometry_mode_note, ' Mean radius is then optionally rescaled to match Mrel_tip.'];
+            end
+        end
 
     case 'solve_phi_from_geometry'
         Vx_target = in.Mx_design * a01;
@@ -219,6 +286,20 @@ switch lower(in.design.solve_mode)
         error('Unknown design.solve_mode: %s', in.design.solve_mode)
 end
 
+if ~exist('rm_continuity','var')
+    rm_continuity = rm;
+    rt_continuity = rt;
+    rh_continuity = rh;
+    A1_continuity = A1;
+end
+if ~exist('tipmach_radius_match','var')
+    tipmach_radius_match = struct('enabled',false,'status','not_applicable', ...
+        'rm_continuity',rm_continuity,'rt_continuity',rt_continuity, ...
+        'rh_continuity',rh_continuity,'A1_continuity',A1_continuity, ...
+        'rm_selected',rm,'relative_shift',(rm-rm_continuity)/max(rm_continuity,1e-12), ...
+        'Mrel_tip_target',in.Mrel_tip_design,'Mrel_tip_selected',NaN);
+end
+
 [T1,p1,rho1] = inlet_static_from_Vx(T01,p01,Vx,air);
 U = omega*rm;
 phi = phi_used;
@@ -227,6 +308,17 @@ mdot_meanline = rho1*Vx*A1;
 Mx_actual = Vx/sqrt(air.gamma*air.R*T1);
 Utip_actual = omega*rt;
 hub_to_tip_actual = rh/rt;
+
+% Continuity/radius diagnostics. These make explicit which density and
+% velocity were used to size the annulus. The active sizing uses the chosen
+% inlet-total convention plus Mx_design. For comparison, ambient_direct uses
+% the ISA static atmosphere directly with Vx=Mx*a_amb; it is not used in the
+% design unless explicitly coded elsewhere.
+a1 = sqrt(air.gamma*air.R*T1);
+continuity_active = make_continuity_radius_diagnostic('active_inlet_model', ...
+    in.mdot, rho1, Vx, in.hub_to_tip, in.design.mean_radius_rule);
+continuity_ambient_direct = make_continuity_radius_diagnostic('ambient_static_direct', ...
+    in.mdot, amb.rho, in.Mx_design*amb.a, in.hub_to_tip, in.design.mean_radius_rule);
 
 % ---------- 2) Velocity triangles ----------
 status_msg(in,'2/12','velocity triangles');
@@ -264,9 +356,31 @@ W2 = hypot(Vx, Wt2);
 Vt1_tip_for_check = spanwise_vtheta(Vt1, rt, rm, in.loss_model.radial.vtheta_mode);
 Mrel_tip_actual = hypot(Vx, Vt1_tip_for_check - Utip_actual)/sqrt(air.gamma*air.R*T1);
 
-RR = (cos(beta2)^2 * tan(beta2))/max(phi,1e-12) ...
-   - (cos(alpha1)^2 * cos(beta2)^2 * tan(alpha1)*tan(beta2))/max(phi^2,1e-12) ...
-   + (cos(alpha1)^2 * tan(alpha1))/max(phi,1e-12);
+% Recovery-ratio stability metric. The velocity triangles in this code are
+% stored with signed angles in a fixed tangential coordinate system:
+%   Vtheta = Vx*tan(alpha), Wtheta = Vx*tan(beta), Vtheta = U + Wtheta.
+% The Cumpsty/course derivation writes the rotor-exit absolute swirl as
+%   Vtheta2 = U - Vx2*tan(beta2_RR),
+% so beta2_RR is the positive geometric rotor-exit relative angle measured
+% opposite to the signed Wtheta direction. In contrast, alpha1 is used in the
+% derivation as signed inlet absolute swirl, Vtheta1 = Vx1*tan(alpha1).
+% Therefore the default stability metric keeps alpha1 signed and converts
+% beta2 with beta2_RR = -beta2_code. RR_signed is retained only as a
+% coordinate-convention diagnostic.
+RR_angle_convention = field_or(in.design,'RR_angle_convention','lecture_signed_alpha_beta2_positive');
+RR_signed = recovery_ratio_from_angles(alpha1, beta2, phi);
+if strcmpi(RR_angle_convention,'signed')
+    alpha1_RR = alpha1;
+    beta2_RR  = beta2;
+elseif strcmpi(RR_angle_convention,'positive_magnitudes_legacy')
+    alpha1_RR = abs(alpha1);
+    beta2_RR  = abs(beta2);
+else
+    alpha1_RR = alpha1;
+    beta2_RR  = -beta2;
+end
+RR_beta2_convention_residual = -beta2_RR; % <=0 only when beta2_RR >= 0
+RR = recovery_ratio_from_angles(alpha1_RR, beta2_RR, phi);
 
 % ---------- 3) Euler work and preliminary total states ----------
 status_msg(in,'3/12','Euler work and preliminary thermodynamic states');
@@ -313,11 +427,9 @@ status_msg(in,'5/12','Reynolds numbers');
 
 mu1 = sutherland_mu(T1);
 mu2 = sutherland_mu(T2);
-Re_rotor  = rho1 * W1 * in.rotor_chord / mu1;
-Re_stator = rho2 * V2 * in.stator_chord / mu2;
 
 % ---------- 6) Howell and DF/Howell solidity sizing ----------
-status_msg(in,'6/12','Howell turning and diffusion-factor checks');
+status_msg(in,'6/12','Howell turning, diffusion-factor checks, and chord closure');
 
 howell = read_howell_curves(in.howell_paths);
 
@@ -333,21 +445,111 @@ DFS_turn = abs(Vt2 - Vt3)/(2*max(V2,1e-12));
 rotor_solidity_design = struct('enabled',false,'sigma',in.rotor_solidity,'status','fixed');
 stator_solidity_design = struct('enabled',false,'sigma',in.stator_solidity,'status','fixed');
 
-if isfield(in.design,'solidity_mode') && strcmpi(in.design.solidity_mode,'from_DF_Howell')
+chord_closure_mode = field_or(in.design,'chord_closure_mode','fixed_chord');
+chord_closure = struct('mode',chord_closure_mode,'iterations',0, ...
+    'rotor_blade_count_active',NaN,'stator_vane_count_active',NaN, ...
+    'rotor_t_over_c',NaN,'stator_t_over_c',NaN);
 
-    rotor_solidity_design = size_solidity_from_DF_Howell( ...
-        'rotor', Dbeta_rotor_deg, abs(rad2deg(beta2)), Re_rotor, ...
-        DFR_base, DFR_turn, howell, in);
+if strcmpi(chord_closure_mode,'blade_count_from_solidity')
+    % Reverse geometry closure requested for the MEANGEN-starting-value
+    % workflow: DF/Howell gives sigma, the selected integer blade count gives
+    % pitch, and chord follows from c = sigma*s.  Re depends on chord, while
+    % Howell includes a Reynolds correction, so a small fixed-point loop is
+    % used.  The loss-model equations themselves are untouched.
+    Zr = field_or(in.design,'rotor_blade_count_active',field_or(in.design,'rotor_blade_count_default',30));
+    Zs = field_or(in.design,'stator_vane_count_active',field_or(in.design,'stator_vane_count_default',40));
+    Zr = max(1,round(Zr));
+    Zs = max(1,round(Zs));
 
-    stator_solidity_design = size_solidity_from_DF_Howell( ...
-        'stator', Dalpha_stator_deg, abs(rad2deg(alpha3)), Re_stator, ...
-        DFS_base, DFS_turn, howell, in);
+    rotor_t_over_c  = field_or(in.design,'rotor_t_over_c',field_or(in.design,'t_over_c',0.10));
+    stator_t_over_c = field_or(in.design,'stator_t_over_c',field_or(in.design,'t_over_c',0.10));
 
-    in.rotor_solidity = rotor_solidity_design.sigma;
-    in.stator_solidity = stator_solidity_design.sigma;
+    n_iter = max(1,round(field_or(in.design,'chord_solidity_iterations',4)));
+    Cmean = 2*pi*rm;
 
-    in.rotor_pitch = in.rotor_chord / in.rotor_solidity;
-    in.stator_pitch = in.stator_chord / in.stator_solidity;
+    % Initial pitch from blade count. Initial chord uses the current/fallback
+    % solidity, then the loop updates solidity and chord consistently.
+    in.rotor_pitch = Cmean/Zr;
+    in.stator_pitch = Cmean/Zs;
+    in.rotor_chord = max(in.rotor_solidity*in.rotor_pitch,1e-6);
+    in.stator_chord = max(in.stator_solidity*in.stator_pitch,1e-6);
+    in.rotor_thickness = rotor_t_over_c*in.rotor_chord;
+    in.stator_thickness = stator_t_over_c*in.stator_chord;
+
+    for k_geom = 1:n_iter
+        Re_rotor  = rho1 * W1 * in.rotor_chord / mu1;
+        Re_stator = rho2 * V2 * in.stator_chord / mu2;
+
+        if isfield(in.design,'solidity_mode') && strcmpi(in.design.solidity_mode,'from_DF_Howell')
+            rotor_solidity_design = size_solidity_from_DF_Howell( ...
+                'rotor', Dbeta_rotor_deg, abs(rad2deg(beta2)), Re_rotor, ...
+                DFR_base, DFR_turn, howell, in);
+
+            stator_solidity_design = size_solidity_from_DF_Howell( ...
+                'stator', Dalpha_stator_deg, abs(rad2deg(alpha3)), Re_stator, ...
+                DFS_base, DFS_turn, howell, in);
+
+            in.rotor_solidity = rotor_solidity_design.sigma;
+            in.stator_solidity = stator_solidity_design.sigma;
+        end
+
+        in.rotor_pitch = Cmean/Zr;
+        in.stator_pitch = Cmean/Zs;
+        in.rotor_chord = max(in.rotor_solidity*in.rotor_pitch,1e-6);
+        in.stator_chord = max(in.stator_solidity*in.stator_pitch,1e-6);
+        in.rotor_thickness = rotor_t_over_c*in.rotor_chord;
+        in.stator_thickness = stator_t_over_c*in.stator_chord;
+    end
+
+    % Final Reynolds numbers and final solidity update at the converged chord.
+    Re_rotor  = rho1 * W1 * in.rotor_chord / mu1;
+    Re_stator = rho2 * V2 * in.stator_chord / mu2;
+    if isfield(in.design,'solidity_mode') && strcmpi(in.design.solidity_mode,'from_DF_Howell')
+        rotor_solidity_design = size_solidity_from_DF_Howell( ...
+            'rotor', Dbeta_rotor_deg, abs(rad2deg(beta2)), Re_rotor, ...
+            DFR_base, DFR_turn, howell, in);
+        stator_solidity_design = size_solidity_from_DF_Howell( ...
+            'stator', Dalpha_stator_deg, abs(rad2deg(alpha3)), Re_stator, ...
+            DFS_base, DFS_turn, howell, in);
+        in.rotor_solidity = rotor_solidity_design.sigma;
+        in.stator_solidity = stator_solidity_design.sigma;
+        in.rotor_chord = max(in.rotor_solidity*in.rotor_pitch,1e-6);
+        in.stator_chord = max(in.stator_solidity*in.stator_pitch,1e-6);
+        in.rotor_thickness = rotor_t_over_c*in.rotor_chord;
+        in.stator_thickness = stator_t_over_c*in.stator_chord;
+        Re_rotor  = rho1 * W1 * in.rotor_chord / mu1;
+        Re_stator = rho2 * V2 * in.stator_chord / mu2;
+    end
+
+    chord_closure.mode = 'blade_count_from_solidity';
+    chord_closure.iterations = n_iter;
+    chord_closure.rotor_blade_count_active = Zr;
+    chord_closure.stator_vane_count_active = Zs;
+    chord_closure.rotor_t_over_c = rotor_t_over_c;
+    chord_closure.stator_t_over_c = stator_t_over_c;
+
+else
+    % Original closure: chord is a user input, solidity gives pitch and blade
+    % count follows from circumference/pitch.
+    Re_rotor  = rho1 * W1 * in.rotor_chord / mu1;
+    Re_stator = rho2 * V2 * in.stator_chord / mu2;
+
+    if isfield(in.design,'solidity_mode') && strcmpi(in.design.solidity_mode,'from_DF_Howell')
+
+        rotor_solidity_design = size_solidity_from_DF_Howell( ...
+            'rotor', Dbeta_rotor_deg, abs(rad2deg(beta2)), Re_rotor, ...
+            DFR_base, DFR_turn, howell, in);
+
+        stator_solidity_design = size_solidity_from_DF_Howell( ...
+            'stator', Dalpha_stator_deg, abs(rad2deg(alpha3)), Re_stator, ...
+            DFS_base, DFS_turn, howell, in);
+
+        in.rotor_solidity = rotor_solidity_design.sigma;
+        in.stator_solidity = stator_solidity_design.sigma;
+
+        in.rotor_pitch = in.rotor_chord / in.rotor_solidity;
+        in.stator_pitch = in.stator_chord / in.stator_solidity;
+    end
 end
 
 f_beta_rotor  = howell.f_beta2(abs(rad2deg(beta2)));
@@ -476,12 +678,22 @@ zetaR = loss.zetaR;
 zetaS = loss.zetaS;
 loss_specific = (zetaS*V3^2 + zetaR*W2^2)/2;
 
+% Row/source-level loss-to-efficiency bookkeeping.  The stage efficiency
+% estimate below is eta ~= 1 - loss_specific/Delta_h0, so each zeta source
+% has an explicit eta penalty.  This is useful for sensitivity checks, e.g.
+% quantifying how much the selected endwall model changes eta_tt.
+eta_penalty = loss_efficiency_penalty_breakdown(loss, W2, V3, Delta_h0);
+eta_penalty_endwall = eta_penalty.rotor.endwall + eta_penalty.stator.endwall;
+
 % Reader Eq. form: eta ~= 1 - (row loss terms)/(psi U^2).  This makes the
 % achieved pressure ratio a consequence of the swept work coefficient rather
 % than an imposed closure.
 eta_tt_est = 1 - loss_specific/max(Delta_h0,eps);
+eta_tt_no_endwall_est = min(1, eta_tt_est + eta_penalty_endwall);
 w_is_est = max(eta_tt_est,0) * Delta_h0;
+w_is_no_endwall_est = max(eta_tt_no_endwall_est,0) * Delta_h0;
 beta_tt_est = (1 + w_is_est/(air.cp*T01))^(air.gamma/(air.gamma-1));
+beta_tt_no_endwall_est = (1 + w_is_no_endwall_est/(air.cp*T01))^(air.gamma/(air.gamma-1));
 p03_est = p01 * beta_tt_est;
 Power = in.mdot * Delta_h0;
 
@@ -525,14 +737,18 @@ residuals.R_min             = R_low_residual;
 residuals.R_max             = R_high_residual;
 residuals.beta_tt_min       = beta_tt_min_residual;
 residuals.beta_tt_max       = beta_tt_max_residual;
+residuals.beta_tt_excess    = max([0; beta_tt_min_residual; beta_tt_max_residual]);
 residuals.lieblein_rotor    = lieblein_rotor_residual;
 residuals.lieblein_stator   = lieblein_stator_residual;
 residuals.Mx_design         = Mx_residual;
 residuals.Mrel_tip_design   = Mrel_tip_residual;
+residuals.Mrel_tip_excess_rel = max(0, abs((Mrel_tip_actual - in.Mrel_tip_design)/max(in.Mrel_tip_design,1e-12)) - fixed_tol);
+residuals.Mrel_tip_radius_match = Mrel_tip_residual;
 residuals.hub_to_tip        = htr_residual;
 residuals.mdot              = mdot_residual;
 residuals.mdot_abs          = mdot_error;       % signed kg/s error, for readable printout
 residuals.mdot_rel          = mdot_rel_error;   % signed relative error, not tolerance-subtracted
+residuals.mdot_excess_rel   = max(0, abs(mdot_rel_error) - fixed_tol);
 residuals.altitude          = altitude_residual;
 residuals.M_flight          = Mflight_residual;
 residuals.N_rpm             = Nrpm_residual;
@@ -556,6 +772,15 @@ end
 if field_or(in.design,'enforce_project_matching_as_hard',false)
     hard_ineq = [hard_ineq; project_ineq];
 end
+if field_or(in.design,'enforce_Mrel_tip_as_hard',false)
+    hard_ineq = [hard_ineq; Mrel_tip_residual];
+end
+if field_or(in.design,'enforce_RR_as_hard',false)
+    hard_ineq = [hard_ineq; RR_soft_residual];
+    if ~strcmpi(RR_angle_convention,'signed')
+        hard_ineq = [hard_ineq; RR_beta2_convention_residual];
+    end
+end
 
 residuals.hard_ineq = hard_ineq;
 residuals.beta_ineq = beta_ineq;
@@ -563,6 +788,9 @@ residuals.project_ineq = project_ineq;
 residuals.all_ineq = hard_ineq;  % backward-compatible: feasibility now means hard aero feasibility
 residuals.all_diagnostics_ineq = [hard_ineq; beta_ineq; project_ineq];
 residuals.soft_RR = RR_soft_residual;
+residuals.RR_beta2_convention = RR_beta2_convention_residual;
+residuals.RR_metric = RR;
+residuals.RR_signed = RR_signed;
 
 is_feasible = all(isfinite(residuals.hard_ineq)) && all(residuals.hard_ineq <= 0);
 if in.design.enforce_hard_limits && ~is_feasible
@@ -580,8 +808,14 @@ out.station = [ ...
     make_station('3',T3,p3,rho3,Vx,Vt3,V3,alpha3,NaN,M3,T03,p03_est) ...
     ];
 out.geometry = struct('rt',rt,'rh',rh,'rm',rm,'A1',A1, ...
+    'rm_continuity',rm_continuity,'A1_continuity',A1_continuity, ...
+    'rt_continuity',rt_continuity,'rh_continuity',rh_continuity, ...
+    'tipmach_radius_match',tipmach_radius_match, ...
     'rotor_pitch',in.rotor_pitch,'stator_pitch',in.stator_pitch, ...
     'rotor_chord',in.rotor_chord,'stator_chord',in.stator_chord, ...
+    'rotor_thickness',in.rotor_thickness,'stator_thickness',field_or(in,'stator_thickness',NaN), ...
+    'rotor_t_over_c',in.rotor_thickness/max(in.rotor_chord,1e-12), ...
+    'stator_t_over_c',field_or(in,'stator_thickness',NaN)/max(in.stator_chord,1e-12), ...
     'rotor_solidity',in.rotor_solidity,'stator_solidity',in.stator_solidity, ...
     'rotor_axial_chord',rotor_axial_chord, ...
     'stator_axial_chord',stator_axial_chord, ...
@@ -590,13 +824,18 @@ out.geometry = struct('rt',rt,'rh',rh,'rm',rm,'A1',A1, ...
     'rotor_tip_clearance',in.rotor_tip_clearance, ...
     'stator_hub_clearance',in.stator_hub_clearance, ...
     'rotor_blades',rotor_blades,'stator_vanes',stator_vanes, ...
+    'chord_closure',chord_closure, ...
     'span_sections',{{'hub','mean','tip'}},'r_sections',[rh rm rt], ...
     'solve_mode',in.design.solve_mode,'solve_mode_note',geometry_mode_note, ...
+    'fixed_mean_radius_duty_active',fixed_radius_duty_active, ...
     'inlet_total_mode',field_or(in.design,'inlet_total_mode','freestream_total'), ...
     'inlet_total_note',inlet_total_note);
 
 out.coeffs = struct('phi_initial',phi_initial,'phi_actual',phi_actual,'phi_used',phi, ...
-    'psi',psi,'R',R,'RR',RR,'beta_tt_target',in.beta_tt_target, ...
+    'psi',psi,'R',R,'RR',RR,'RR_signed',RR_signed, ...
+    'RR_angle_convention',RR_angle_convention, ...
+    'alpha1_RR_deg',rad2deg(alpha1_RR),'beta2_RR_deg',rad2deg(beta2_RR), ...
+    'beta_tt_target',in.beta_tt_target, ...
     'beta_tt_ideal_from_work',beta_tt_ideal_from_work,'beta_tt_est',beta_tt_est, ...
     'alpha1_mode',alpha1_mode);
 out.angles_deg = struct('alpha1',rad2deg(alpha1),'beta1',rad2deg(beta1), ...
@@ -631,16 +870,38 @@ out.design_basis = struct('Mx_target',in.Mx_design,'Mx_actual',Mx_actual, ...
     'phi_min',phi_min,'phi_max',phi_max,'psi_min',psi_min,'psi_max',psi_max, ...
     'R_min',R_min,'R_max',R_max, ...
     'Utip',Utip_actual,'Vt1_tip_for_check',Vt1_tip_for_check, ...
+    'rho_radius_eval',rho1,'T_radius_eval',T1,'p_radius_eval',p1, ...
+    'a_radius_eval',a1,'Vx_radius_eval',Vx,'A_radius_eval',A1, ...
+    'rt_radius_eval',rt,'rh_radius_eval',rh,'rm_radius_eval',rm, ...
+    'rt_continuity',rt_continuity,'rh_continuity',rh_continuity, ...
+    'rm_continuity',rm_continuity,'A1_continuity',A1_continuity, ...
+    'tipmach_radius_match',tipmach_radius_match, ...
+    'mean_radius_rule',in.design.mean_radius_rule, ...
+    'fixed_mean_radius_duty_active',fixed_radius_duty_active, ...
+    'T01',T01,'p01',p01,'inlet_total_mode',field_or(in.design,'inlet_total_mode','freestream_total'), ...
+    'ambient_T',amb.T,'ambient_p',amb.p,'ambient_rho',amb.rho,'ambient_a',amb.a, ...
+    'continuity_active',continuity_active,'continuity_ambient_direct',continuity_ambient_direct, ...
     'altitude_m',in.altitude_m,'M_flight',in.M_flight,'N_rpm',in.N_rpm);
-out.stability = struct('RR',RR,'RR_soft_min',RR_soft_min, ...
+out.stability = struct('RR',RR,'RR_signed',RR_signed, ...
+    'RR_angle_convention',RR_angle_convention, ...
+    'alpha1_RR_deg',rad2deg(alpha1_RR),'beta2_RR_deg',rad2deg(beta2_RR), ...
+    'alpha1_signed_deg',rad2deg(alpha1),'beta2_signed_deg',rad2deg(beta2), ...
+    'beta2_RR_positive_residual',RR_beta2_convention_residual, ...
+    'beta2_RR_positive_ok',RR_beta2_convention_residual <= 0, ...
+    'RR_soft_min',RR_soft_min, ...
     'RR_soft_residual',RR_soft_residual,'RR_soft_ok',RR_soft_residual <= 0, ...
-    'interpretation','RR closer to 1 is favourable; RR near 0 is adverse.');
+    'interpretation','RR closer to 1 is favourable; RR near 0 is adverse. Default RR keeps alpha1 signed and uses beta2_RR = -beta2_code, matching the course derivation Vtheta2 = U - Vx*tan(beta2). RR_signed is only a coordinate-convention diagnostic.');
 out.lieblein = lieblein;
 out.loss = loss;
 out.loss.loss_model_used = in_loss.loss_model;
+out.loss.eta_penalty = eta_penalty;
+out.loss.eta_penalty_endwall = eta_penalty_endwall;
 out.performance = struct('Delta_h0',Delta_h0,'loss_specific',loss_specific, ...
     'w_is_est',w_is_est,'w_is_target_at_beta_tt_target',w_is_target, ...
     'eta_tt_est',eta_tt_est,'beta_tt_est',beta_tt_est, ...
+    'eta_tt_no_endwall_est',eta_tt_no_endwall_est, ...
+    'beta_tt_no_endwall_est',beta_tt_no_endwall_est, ...
+    'eta_penalty_endwall',eta_penalty_endwall, ...
     'power_W',Power,'torque_Nm',Torque,'tangential_force_N',Ft_tan, ...
     'centrifugal_force_per_blade_N',Fc_blade);
 out.constraints = struct('residuals',residuals,'is_feasible',is_feasible);
@@ -652,19 +913,27 @@ end
 
 
 function out_best = meanline_design_sweep_project(in)
-% Sweep duty coefficients to find a good starting point for MEANGEN.
-% Hard limits:
-%   phi_min <= phi <= phi_max
-%   psi_min <= psi <= psi_max
-%   R_min   <= R   <= R_max
-% plus fixed-project constraints such as Mx, Mrel_tip, hub-to-tip, mdot and
-% beta_tt range. In alpha1=0 mode, R is not swept independently; it follows
-% from R = 1 - psi/2 for alpha1 = 0.
+% Sweep duty coefficients to find a good starting point for MEANGEN.  In the
+% continuity-fixed project mode phi is computed from geometry.  In the
+% Denton/MEANGEN-style fixed-radius mode phi and psi are swept at a fixed
+% design mean radius, and alpha1=0 gives R=1-psi/2.
 
 status_msg(in,'SWEEP','started project-constrained duty sweep');
 
-phi_grid = linspace(in.design.phi_min, in.design.phi_max, ...
-                    field_or(in.design,'phi_search_points',21));
+use_continuity_fixed_radius = field_or(in.design,'use_continuity_fixed_radius',true);
+use_fixed_mean_radius_duty = strcmpi(field_or(in.design,'solve_mode',''),'sweep_fixed_mean_radius_duty') || ...
+    field_or(in.design,'fixed_mean_radius_duty_active',false);
+if use_fixed_mean_radius_duty
+    phi_grid = linspace(in.design.phi_min, in.design.phi_max, ...
+                        field_or(in.design,'phi_search_points',21));
+elseif use_continuity_fixed_radius
+    phi_grid = NaN;  % placeholder; candidate evaluator computes phi from continuity-fixed r_m
+else
+    phi_grid = linspace(in.design.phi_min, in.design.phi_max, ...
+                        field_or(in.design,'phi_search_points',21));
+    phi_grid = augment_phi_grid_for_mdot_target(phi_grid, in);
+end
+
 psi_grid = linspace(in.design.psi_min, in.design.psi_max, ...
                     field_or(in.design,'psi_search_points',21));
 R_grid   = linspace(in.design.R_min, in.design.R_max, ...
@@ -680,8 +949,32 @@ switch lower(mode_request)
         alpha_modes = {'free'};
 end
 
-n_free = numel(phi_grid)*numel(psi_grid)*numel(R_grid);
-n_zero = numel(phi_grid)*numel(psi_grid);
+blade_count_selection_mode = field_or(in.design,'blade_count_selection_mode','postprocess_table_only');
+use_blade_count_chord_closure = strcmpi(field_or(in.design,'chord_closure_mode','fixed_chord'),'blade_count_from_solidity');
+
+if use_blade_count_chord_closure && strcmpi(blade_count_selection_mode,'sweep_in_objective') && ...
+        field_or(in.design,'blade_count_sweep',true)
+    % Legacy behavior: blade count participates in the optimizer objective.
+    % This can introduce artificial Z preferences when the meanline loss model
+    % has weak/neutral blade-count sensitivity.
+    rotorZ_grid = field_or(in.design,'rotor_blade_count_range',15:40);
+    statorZ_grid = field_or(in.design,'stator_vane_count_range',20:60);
+elseif use_blade_count_chord_closure
+    % Recommended behavior: do not let Z participate in objective selection.
+    % Use a single reference count only to close the chord/Re-dependent
+    % preliminary loss estimate; after the best duty/solidity candidate is
+    % selected, generate a post-processing table for all Z_R/Z_S combinations.
+    rotorZ_grid = field_or(in.design,'rotor_blade_count_default',30);
+    statorZ_grid = field_or(in.design,'stator_vane_count_default',40);
+else
+    rotorZ_grid = NaN;
+    statorZ_grid = NaN;
+end
+rotorZ_grid = rotorZ_grid(:).';
+statorZ_grid = statorZ_grid(:).';
+
+n_free = numel(phi_grid)*numel(psi_grid)*numel(R_grid)*numel(rotorZ_grid)*numel(statorZ_grid);
+n_zero = numel(phi_grid)*numel(psi_grid)*numel(rotorZ_grid)*numel(statorZ_grid);
 n_total = 0;
 for im = 1:numel(alpha_modes)
     if strcmpi(alpha_modes{im},'zero')
@@ -696,6 +989,14 @@ history.phi = nan(n_total,1);
 history.psi = nan(n_total,1);
 history.R = nan(n_total,1);
 history.alpha1_mode = cell(n_total,1);
+history.rotor_blades = nan(n_total,1);
+history.stator_vanes = nan(n_total,1);
+history.rotor_chord = nan(n_total,1);
+history.stator_chord = nan(n_total,1);
+history.rotor_solidity = nan(n_total,1);
+history.stator_solidity = nan(n_total,1);
+history.mdot = nan(n_total,1);
+history.Mrel_tip = nan(n_total,1);
 history.score = inf(n_total,1);
 history.eta = nan(n_total,1);
 history.beta_tt = nan(n_total,1);
@@ -724,69 +1025,95 @@ for im = 1:numel(alpha_modes)
     for ip = 1:numel(phi_grid)
         for iw = 1:numel(psi_grid)
             for ir = 1:numel(R_loop)
-                count = count + 1;
+                for izr = 1:numel(rotorZ_grid)
+                    for izs = 1:numel(statorZ_grid)
+                        count = count + 1;
 
-                trial = in;
-                trial.design.solve_mode = 'project_fixed_candidate';
-                trial.design.sweep_active = true;
-                trial.design.alpha1_mode_active = mode;
-                trial.design.status_print = false;
-                trial.phi = phi_grid(ip);
-                trial.psi = psi_grid(iw);
+                        trial = in;
+                        trial.design.solve_mode = 'project_fixed_candidate';
+                        trial.design.sweep_active = true;
+                        trial.design.fixed_mean_radius_duty_active = use_fixed_mean_radius_duty;
+                        trial.design.alpha1_mode_active = mode;
+                        trial.design.status_print = false;
+                        if use_fixed_mean_radius_duty || ~use_continuity_fixed_radius
+                            trial.phi = phi_grid(ip);
+                        end
+                        trial.psi = psi_grid(iw);
 
-                if strcmpi(mode,'zero')
-                    trial.R = 1 - trial.psi/2;
-                else
-                    trial.R = R_loop(ir);
-                end
+                        if strcmpi(mode,'zero')
+                            trial.R = 1 - trial.psi/2;
+                        else
+                            trial.R = R_loop(ir);
+                        end
 
-                try
-                    cand = meanline_fan_design(trial);
-                    c = cand.constraints.residuals.all_ineq(:);
-                    feasible = all(isfinite(c)) && all(c <= 0);
-                    max_res = max(c);
-                    J = meanline_preliminary_objective(cand, in);
-                    score_any = J + hard_constraint_penalty(c);
+                        if ~isnan(rotorZ_grid(izr))
+                            trial.design.rotor_blade_count_active = rotorZ_grid(izr);
+                            trial.design.stator_vane_count_active = statorZ_grid(izs);
+                        end
 
-                    history.phi(count) = cand.coeffs.phi_used;
-                    history.psi(count) = cand.coeffs.psi;
-                    history.R(count) = cand.coeffs.R;
-                    history.alpha1_mode{count} = mode;
-                    history.score(count) = score_any;
-                    history.eta(count) = cand.performance.eta_tt_est;
-                    history.beta_tt(count) = cand.coeffs.beta_tt_est;
-                    history.RR(count) = cand.coeffs.RR;
-                    history.feasible(count) = feasible;
-                    history.max_residual(count) = max_res;
-                    history.message{count} = '';
+                        try
+                            cand = meanline_fan_design(trial);
+                            c = cand.constraints.residuals.all_ineq(:);
+                            feasible = all(isfinite(c)) && all(c <= 0);
+                            max_res = max(c);
+                            J = meanline_preliminary_objective(cand, in);
+                            score_any = J + hard_constraint_penalty(c);
 
-                    if feasible && J < best_feasible_score
-                        best_feasible_score = J;
-                        out_best_feasible = cand;
+                            history.phi(count) = cand.coeffs.phi_used;
+                            history.psi(count) = cand.coeffs.psi;
+                            history.R(count) = cand.coeffs.R;
+                            history.alpha1_mode{count} = mode;
+                            history.rotor_blades(count) = cand.geometry.rotor_blades;
+                            history.stator_vanes(count) = cand.geometry.stator_vanes;
+                            history.rotor_chord(count) = cand.geometry.rotor_chord;
+                            history.stator_chord(count) = cand.geometry.stator_chord;
+                            history.rotor_solidity(count) = cand.geometry.rotor_solidity;
+                            history.stator_solidity(count) = cand.geometry.stator_solidity;
+                            history.mdot(count) = cand.design_basis.mdot_meanline;
+                            history.Mrel_tip(count) = cand.design_basis.Mrel_tip_actual;
+                            history.score(count) = score_any;
+                            history.eta(count) = cand.performance.eta_tt_est;
+                            history.beta_tt(count) = cand.coeffs.beta_tt_est;
+                            history.RR(count) = cand.coeffs.RR;
+                            history.feasible(count) = feasible;
+                            history.max_residual(count) = max_res;
+                            history.message{count} = '';
+
+                            if feasible && J < best_feasible_score
+                                best_feasible_score = J;
+                                out_best_feasible = cand;
+                            end
+
+                            if score_any < best_any_score
+                                best_any_score = score_any;
+                                out_best_any = cand;
+                            end
+
+                        catch ME
+                            if use_fixed_mean_radius_duty || ~use_continuity_fixed_radius
+                                history.phi(count) = trial.phi;
+                            end
+                            history.psi(count) = trial.psi;
+                            history.R(count) = trial.R;
+                            history.alpha1_mode{count} = mode;
+                            if ~isnan(rotorZ_grid(izr))
+                                history.rotor_blades(count) = rotorZ_grid(izr);
+                                history.stator_vanes(count) = statorZ_grid(izs);
+                            end
+                            history.message{count} = ME.message;
+                        end
+
+                        if field_or(in.design,'status_print',true) && ...
+                                (mod(count,status_every)==0 || count==1 || count==n_total)
+                            if isempty(out_best_feasible)
+                                best_note = sprintf('no feasible yet; best violation %.3g', best_any_score);
+                            else
+                                best_note = sprintf('best feasible J %.6g', best_feasible_score);
+                            end
+                            fprintf('[meanline][SWEEP] %d/%d candidates evaluated; %s\n', ...
+                                count, n_total, best_note);
+                        end
                     end
-
-                    if score_any < best_any_score
-                        best_any_score = score_any;
-                        out_best_any = cand;
-                    end
-
-                catch ME
-                    history.phi(count) = trial.phi;
-                    history.psi(count) = trial.psi;
-                    history.R(count) = trial.R;
-                    history.alpha1_mode{count} = mode;
-                    history.message{count} = ME.message;
-                end
-
-                if field_or(in.design,'status_print',true) && ...
-                        (mod(count,status_every)==0 || count==1 || count==n_total)
-                    if isempty(out_best_feasible)
-                        best_note = sprintf('no feasible yet; best violation %.3g', best_any_score);
-                    else
-                        best_note = sprintf('best feasible J %.6g', best_feasible_score);
-                    end
-                    fprintf('[meanline][SWEEP] %d/%d candidates evaluated; %s\n', ...
-                        count, n_total, best_note);
                 end
             end
         end
@@ -807,7 +1134,7 @@ if ~isempty(out_best_feasible)
     selected_source = 'best_feasible';
 else
     if isempty(out_best_any)
-        error('Project duty sweep failed: no candidate could be evaluated.');
+        error('Project duty/blade-count sweep failed: no candidate could be evaluated.');
     end
     out_best = out_best_any;
     selected_source = 'least_violating_no_feasible_candidate';
@@ -820,8 +1147,138 @@ out_best.sweep.best_any_penalized_score = best_any_score;
 out_best.sweep.best_feasible_objective = best_feasible_score;
 out_best.sweep.feasible_count = nnz(history.feasible);
 out_best.sweep.total_count = count;
+out_best.sweep.use_continuity_fixed_radius = use_continuity_fixed_radius;
+out_best.sweep.use_fixed_mean_radius_duty = use_fixed_mean_radius_duty;
+out_best.sweep.rotor_blade_count_range = rotorZ_grid;
+out_best.sweep.stator_vane_count_range = statorZ_grid;
+out_best.sweep.blade_count_selection_mode = blade_count_selection_mode;
+
+if use_blade_count_chord_closure && strcmpi(blade_count_selection_mode,'postprocess_table_only')
+    out_best.blade_count_table = make_blade_count_geometry_table(out_best, in);
+end
+
+% A real beta_tt-mdot speedline is intentionally not generated by this
+% preliminary on-design sweep. Such a speedline requires fixed-geometry
+% off-design operating points at the same shaft speed (typically from
+% MULTALL/back-pressure or an off-design meanline solver). The current sweep
+% changes duty variables and may change geometry/radius, so it cannot locate
+% choke reliably.
+out_best.speedline = struct('computed',false, ...
+    'status','not_computed_fixed_geometry_off_design_required', ...
+    'minimum_points_required',5, ...
+    'reason',['A true compressor speedline/choke map requires at least several fixed-geometry off-design ', ...
+              'solutions at the same shaft speed. The preliminary meanline sweep changes design variables ', ...
+              'and is not a throttle/back-pressure continuation.']);
 
 status_msg(in,'SWEEP','completed project-constrained duty sweep');
+end
+
+
+function T = make_blade_count_geometry_table(out, in)
+%MAKE_BLADE_COUNT_GEOMETRY_TABLE Generate geometry options without using
+%blade count in the meanline objective.  The selected aerodynamic candidate
+%sets rm, solidity and stagger; each integer blade-count pair is then mapped
+%to pitch/chord/axial chord/Re/thickness for MEANGEN/STAGEN screening.
+
+rotorZ = field_or(in.design,'rotor_blade_count_range',15:40);
+statorZ = field_or(in.design,'stator_vane_count_range',20:60);
+rotorZ = rotorZ(:).';
+statorZ = statorZ(:).';
+
+n = numel(rotorZ)*numel(statorZ);
+ZR = nan(n,1); ZS = nan(n,1);
+sR = nan(n,1); sS = nan(n,1);
+cR = nan(n,1); cS = nan(n,1);
+CxR = nan(n,1); CxS = nan(n,1);
+tR = nan(n,1); tS = nan(n,1);
+ReR = nan(n,1); ReS = nan(n,1);
+AR_R = nan(n,1); AR_S = nan(n,1);
+
+rm = out.geometry.rm;
+span = out.geometry.rt - out.geometry.rh;
+sigmaR = out.geometry.rotor_solidity;
+sigmaS = out.geometry.stator_solidity;
+stagR = out.geometry.rotor_stagger_for_axial_chord_deg;
+stagS = out.geometry.stator_stagger_for_axial_chord_deg;
+tcR = out.geometry.rotor_t_over_c;
+tcS = out.geometry.stator_t_over_c;
+
+rho1 = out.station(1).rho;
+rho2 = out.station(2).rho;
+T1 = out.station(1).T;
+T2 = out.station(2).T;
+mu1 = sutherland_mu(T1);
+mu2 = sutherland_mu(T2);
+W1 = out.velocities.W1;
+V2 = out.velocities.V2;
+
+k = 0;
+for i = 1:numel(rotorZ)
+    for j = 1:numel(statorZ)
+        k = k + 1;
+        ZR(k) = rotorZ(i);
+        ZS(k) = statorZ(j);
+        sR(k) = 2*pi*rm/ZR(k);
+        sS(k) = 2*pi*rm/ZS(k);
+        cR(k) = sigmaR*sR(k);
+        cS(k) = sigmaS*sS(k);
+        CxR(k) = cR(k)*abs(cosd(stagR));
+        CxS(k) = cS(k)*abs(cosd(stagS));
+        tR(k) = tcR*cR(k);
+        tS(k) = tcS*cS(k);
+        ReR(k) = rho1*W1*cR(k)/max(mu1,1e-12);
+        ReS(k) = rho2*V2*cS(k)/max(mu2,1e-12);
+        AR_R(k) = span/max(cR(k),1e-12);
+        AR_S(k) = span/max(cS(k),1e-12);
+    end
+end
+
+T = table(ZR,ZS,sR,sS,cR,cS,CxR,CxS,tR,tS,ReR,ReS,AR_R,AR_S, ...
+    'VariableNames',{'ZR','ZS','pitch_R','pitch_S','chord_R','chord_S', ...
+                     'Cx_R','Cx_S','t_R','t_S','Re_R','Re_S','AR_R','AR_S'});
+end
+
+
+function phi_grid = augment_phi_grid_for_mdot_target(phi_grid, in)
+% Add local phi samples near the phi implied by mdot for the project-fixed
+% Mx/htr/RPM closure. In this closure, Mx fixes Vx and rho, while phi fixes
+% rm = (Vx/phi)/omega. With fixed hub-to-tip ratio, A scales with rm^2, so
+% mdot scales approximately with 1/phi^2. This helper only improves sampling;
+% it does not force mdot.
+if ~isfield(in,'design') || ~field_or(in.design,'phi_grid_include_mdot_target',false)
+    return
+end
+
+try
+    air = in.air;
+    amb = isa_atmosphere(in.altitude_m);
+    [T01,p01,~] = inlet_total_conditions(amb, in.M_flight, air, ...
+        field_or(in.design,'inlet_total_mode','freestream_total'));
+    [~,~,rho1,Vx] = inlet_static_from_Mx(T01,p01,in.Mx_design,air);
+    omega = 2*pi*in.N_rpm/60;
+
+    % Compute mdot at phi = 1 using the same radius/area closure as the
+    % candidate evaluator, then use mdot(phi)=mdot(phi=1)/phi^2.
+    rm_phi1 = Vx/omega;
+    [rt1,rh1] = radii_from_mean_and_ratio(rm_phi1, in.hub_to_tip, in.design.mean_radius_rule);
+    A_phi1 = pi*(rt1^2-rh1^2);
+    mdot_phi1 = rho1*Vx*A_phi1;
+    phi_target = sqrt(mdot_phi1/max(in.mdot,1e-12));
+
+    phi_min = field_or(in.design,'phi_min',min(phi_grid));
+    phi_max = field_or(in.design,'phi_max',max(phi_grid));
+    if isfinite(phi_target) && phi_target >= phi_min && phi_target <= phi_max
+        half_width = field_or(in.design,'phi_grid_mdot_refine_half_width',0.08);
+        n_ref = max(3,round(field_or(in.design,'phi_grid_mdot_refine_points',9)));
+        lo = max(phi_min, phi_target*(1-half_width));
+        hi = min(phi_max, phi_target*(1+half_width));
+        local_phi = linspace(lo, hi, n_ref);
+        phi_grid = unique(sort([phi_grid(:); phi_target; local_phi(:)]).');
+    end
+catch
+    % Do not let a sampling helper stop the design run. The original coarse
+    % grid remains valid if the target estimate cannot be formed.
+end
 end
 
 
@@ -1014,10 +1471,16 @@ end
 
 J = 1 - eta + w_beta*((beta_eval - beta_pref)/beta_pref)^2;
 
+relax_mdot_penalty = (field_or(in.design,'relax_mdot_penalty_when_matching_tip_radius',false) && ...
+    field_or(in.design,'match_Mrel_tip_by_mean_radius',false)) || ...
+    (field_or(in.design,'relax_mdot_penalty_in_fixed_radius_duty',false) && ...
+    (strcmpi(field_or(in.design,'solve_mode',''),'sweep_fixed_mean_radius_duty') || ...
+     field_or(in.design,'fixed_mean_radius_duty_active',false)));
+
 % Soft project-matching terms. These influence ranking but do not turn the
 % candidate into a hard failure unless the corresponding hard switches are
 % enabled in default_fan_inputs.
-if isfield(in.design,'mdot_penalty_weight') && in.design.mdot_penalty_weight > 0 && ...
+if ~relax_mdot_penalty && isfield(in.design,'mdot_penalty_weight') && in.design.mdot_penalty_weight > 0 && ...
         isfield(out,'design_basis') && isfield(out.design_basis,'mdot_rel_error')
     J = J + in.design.mdot_penalty_weight * out.design_basis.mdot_rel_error^2;
 end
@@ -1027,6 +1490,25 @@ if isfield(in.design,'Mrel_tip_penalty_weight') && in.design.Mrel_tip_penalty_we
     Mrel_target = max(out.design_basis.Mrel_tip_target,1e-12);
     Mrel_err = (out.design_basis.Mrel_tip_actual - out.design_basis.Mrel_tip_target)/Mrel_target;
     J = J + in.design.Mrel_tip_penalty_weight * Mrel_err^2;
+end
+
+% Bound-excess penalties: no penalty inside the project tolerance band, then
+% quadratic growth outside the band. This is useful when mdot/Mrel/beta are
+% soft diagnostics but should still dominate ranking once they are clearly
+% outside the allowed band.
+if ~relax_mdot_penalty && isfield(in.design,'mdot_excess_penalty_weight') && in.design.mdot_excess_penalty_weight > 0 && ...
+        isfield(out,'constraints') && isfield(out.constraints.residuals,'mdot_excess_rel')
+    J = J + in.design.mdot_excess_penalty_weight * out.constraints.residuals.mdot_excess_rel^2;
+end
+
+if isfield(in.design,'Mrel_tip_excess_penalty_weight') && in.design.Mrel_tip_excess_penalty_weight > 0 && ...
+        isfield(out,'constraints') && isfield(out.constraints.residuals,'Mrel_tip_excess_rel')
+    J = J + in.design.Mrel_tip_excess_penalty_weight * out.constraints.residuals.Mrel_tip_excess_rel^2;
+end
+
+if isfield(in.design,'beta_tt_excess_penalty_weight') && in.design.beta_tt_excess_penalty_weight > 0 && ...
+        isfield(out,'constraints') && isfield(out.constraints.residuals,'beta_tt_excess')
+    J = J + in.design.beta_tt_excess_penalty_weight * out.constraints.residuals.beta_tt_excess^2;
 end
 
 if isfield(in.design,'R_penalty_weight') && in.design.R_penalty_weight > 0 && ...
@@ -1141,6 +1623,9 @@ else
 end
 
 sigma_grid = linspace(sigma_min, sigma_max, N);
+if isfinite(sigma_from_DF)
+    sigma_grid = unique(sort([sigma_grid, min(max(sigma_from_DF,sigma_min),sigma_max)]));
+end
 DF_grid = DF_base + DF_turn ./ sigma_grid;
 
 f_beta = howell.f_beta2(exit_angle_deg);
@@ -1154,6 +1639,7 @@ ok_DF = DF_grid >= DF_min & DF_grid <= DF_max;
 ok_Howell = Howell_residual_grid <= 0;
 ok = ok_DF & ok_Howell & isfinite(DF_grid) & isfinite(Howell_residual_grid);
 
+selected_reason = '';
 if any(ok)
     idx_ok = find(ok);
 
@@ -1161,10 +1647,40 @@ if any(ok)
         case 'closest_to_df_target'
             [~,j] = min(abs(DF_grid(idx_ok) - target));
             idx = idx_ok(j);
+            selected_reason = 'closest feasible DF to target';
 
         case 'minimum_solidity_feasible'
             [~,j] = min(sigma_grid(idx_ok));
             idx = idx_ok(j);
+            selected_reason = 'minimum feasible solidity';
+
+        case {'df_target_then_howell','df_target_then_howell_increment','df_target_howell'}
+            if isfinite(sigma_from_DF)
+                sigma_start = min(max(sigma_from_DF,sigma_min),sigma_max);
+            else
+                sigma_start = sigma_min;
+            end
+
+            % Start from the DF=target solidity and only increase solidity
+            % if Howell turning requires it. This avoids the previous bias
+            % toward the minimum feasible solidity.
+            idx_after = idx_ok(sigma_grid(idx_ok) >= sigma_start - 1e-12);
+            if ~isempty(idx_after)
+                [~,j] = min(sigma_grid(idx_after));
+                idx = idx_after(j);
+                if abs(sigma_grid(idx) - sigma_start) <= 1e-6*max(1,sigma_start)
+                    selected_reason = 'DF target satisfied Howell';
+                else
+                    selected_reason = 'DF target increased until Howell passed';
+                end
+            else
+                % If increasing from the DF target cannot satisfy all checks
+                % inside the search range, fall back to the feasible point
+                % closest to the target DF instead of jumping to sigma_min.
+                [~,j] = min(abs(DF_grid(idx_ok) - target));
+                idx = idx_ok(j);
+                selected_reason = 'fallback closest feasible DF to target';
+            end
 
         otherwise
             error('Unknown design.solidity_policy: %s', in.design.solidity_policy)
@@ -1176,8 +1692,16 @@ else
                 max(0, DF_grid - DF_max).^2 + ...
                 max(0, Howell_residual_grid/max(required_turn_deg,1)).^2;
 
+    if isfinite(sigma_from_DF)
+        % In infeasible cases, prefer the least-violating point near/above
+        % the DF-target solidity rather than blindly selecting sigma_min.
+        sigma_start = min(max(sigma_from_DF,sigma_min),sigma_max);
+        violation = violation + 1e-3*((sigma_grid - sigma_start)./max(sigma_start,1e-12)).^2;
+    end
+
     [~,idx] = min(violation);
     status = 'no_feasible_sigma_in_search_range';
+    selected_reason = 'least violation in search range';
 end
 
 sol = struct();
@@ -1193,9 +1717,13 @@ sol.DF_limit = DF_max;
 sol.required_turn_deg = required_turn_deg;
 sol.howell_limit_deg = Howell_limit_grid(idx);
 sol.howell_residual_deg = Howell_residual_grid(idx);
-sol.howell_ok = sol.howell_residual_deg <= 0;
-sol.DF_range_ok = sol.DF >= DF_min && sol.DF <= DF_max;
+sol.howell_ok = Howell_residual_grid(idx) <= 0;
+sol.DF_ok = DF_grid(idx) >= DF_min && DF_grid(idx) <= DF_max;
 sol.status = status;
+sol.selected_reason = selected_reason;
+sol.policy = in.design.solidity_policy;
+sol.Re = Re;
+sol.exit_angle_deg = exit_angle_deg;
 end
 
 function [Cx, stagger_deg] = axial_chord_projection(chord, chi_in_signed, chi_out_signed, lieblein, rowType)
@@ -1289,6 +1817,111 @@ phi = vals.phi;
 psi = vals.psi;
 Mrel_tip = vals.Mrel_tip;
 Vt1_tip = vals.Vt1_tip;
+end
+
+
+function [rt,rh,rm,A,match] = match_radius_to_tip_mach(rm0, lambda, mean_radius_rule, Vx, T1, air, omega, psi, R_in, alpha1_mode, alpha1_deg, Mrel_target, vtheta_mode, design)
+%MATCH_RADIUS_TO_TIP_MACH Rescale mean radius about the continuity value to
+% match the target rotor-inlet relative tip Mach number. The hub-to-tip ratio
+% remains fixed, so area and meanline mdot become diagnostics rather than the
+% quantity used to set r_m. This is intended for MEANGEN/MULTALL starting
+% values where the downstream simulation will prescribe mdot and adjust blade
+% shape/throttle.
+max_rel = field_or(design,'Mrel_tip_radius_match_max_rel',0.20);
+tol_rel = field_or(design,'Mrel_tip_radius_match_tol_rel',field_or(design,'fixed_tolerance_rel',0.02));
+rm_lo = max(rm0*(1-max_rel), 1e-6);
+rm_hi = max(rm0*(1+max_rel), rm_lo*(1+1e-6));
+
+a1 = sqrt(air.gamma*air.R*T1);
+forced_alpha1 = any(strcmpi(alpha1_mode,{'zero','force_zero','fixed_zero'}));
+
+    function [fval,Mrel,vals] = residual_for_rm(rm_trial)
+        [rt_trial,rh_trial] = radii_from_mean_and_ratio(rm_trial, lambda, mean_radius_rule);
+        U_trial = omega*rm_trial;
+        phi_trial = Vx/max(U_trial,1e-12);
+        if forced_alpha1
+            tan_a1_trial = tand(alpha1_deg);
+        else
+            tan_a1_trial = (1 - R_in - psi/2)/max(phi_trial,1e-12);
+        end
+        Vt1_trial = Vx*tan_a1_trial;
+        Vt1_tip_trial = spanwise_vtheta(Vt1_trial, rt_trial, rm_trial, vtheta_mode);
+        Utip_trial = omega*rt_trial;
+        Mrel = hypot(Vx, Vt1_tip_trial - Utip_trial)/max(a1,1e-12);
+        fval = Mrel - Mrel_target;
+        vals = struct('rt',rt_trial,'rh',rh_trial,'rm',rm_trial, ...
+            'A',pi*(rt_trial^2-rh_trial^2), ...
+            'phi',phi_trial,'Vt1_tip',Vt1_tip_trial,'Utip',Utip_trial, ...
+            'Mrel_tip',Mrel);
+    end
+
+[f_lo,M_lo] = residual_for_rm(rm_lo);
+[f_hi,M_hi] = residual_for_rm(rm_hi);
+status = 'matched_by_fzero';
+
+if isfinite(f_lo) && isfinite(f_hi) && f_lo*f_hi <= 0
+    try
+        rm = fzero(@(x) residual_for_rm(x), [rm_lo rm_hi]);
+        [f_sel,M_sel,vals] = residual_for_rm(rm);
+    catch
+        rm_grid = linspace(rm_lo,rm_hi,81);
+        f_grid = nan(size(rm_grid)); M_grid = nan(size(rm_grid)); vals_grid = cell(size(rm_grid));
+        for ii = 1:numel(rm_grid)
+            [f_grid(ii),M_grid(ii),vals_grid{ii}] = residual_for_rm(rm_grid(ii));
+        end
+        [~,ii] = min(abs(f_grid));
+        vals = vals_grid{ii}; rm = vals.rm; f_sel = f_grid(ii); M_sel = M_grid(ii);
+        status = 'closest_grid_after_fzero_failure';
+    end
+else
+    rm_grid = linspace(rm_lo,rm_hi,81);
+    f_grid = nan(size(rm_grid)); M_grid = nan(size(rm_grid)); vals_grid = cell(size(rm_grid));
+    for ii = 1:numel(rm_grid)
+        [f_grid(ii),M_grid(ii),vals_grid{ii}] = residual_for_rm(rm_grid(ii));
+    end
+    [~,ii] = min(abs(f_grid));
+    vals = vals_grid{ii}; rm = vals.rm; f_sel = f_grid(ii); M_sel = M_grid(ii);
+    if abs(f_sel)/max(Mrel_target,1e-12) <= tol_rel
+        status = 'matched_by_grid_no_bracket';
+    else
+        status = 'closest_within_radius_bound_not_within_tolerance';
+    end
+end
+
+rt = vals.rt;
+rh = vals.rh;
+A = vals.A;
+match = struct();
+match.enabled = true;
+match.status = status;
+match.rm_continuity = rm0;
+[rt0,rh0] = radii_from_mean_and_ratio(rm0, lambda, mean_radius_rule);
+match.rt_continuity = rt0;
+match.rh_continuity = rh0;
+match.A1_continuity = pi*(rt0^2-rh0^2);
+match.rm_selected = rm;
+match.rt_selected = rt;
+match.rh_selected = rh;
+match.A1_selected = A;
+match.relative_shift = (rm-rm0)/max(rm0,1e-12);
+match.max_relative_shift_allowed = max_rel;
+match.Mrel_tip_target = Mrel_target;
+match.Mrel_tip_selected = M_sel;
+match.Mrel_tip_rel_error = f_sel/max(Mrel_target,1e-12);
+match.within_tolerance = abs(match.Mrel_tip_rel_error) <= tol_rel;
+match.tolerance_rel = tol_rel;
+match.Mrel_tip_at_lower_bound = M_lo;
+match.Mrel_tip_at_upper_bound = M_hi;
+end
+
+function d = make_continuity_radius_diagnostic(label, mdot, rho, Vx, hub_to_tip, mean_radius_rule)
+%MAKE_CONTINUITY_RADIUS_DIAGNOSTIC Return area/radius implied by continuity.
+A = mdot/(rho*Vx);
+[rt,rh] = radii_from_area_and_ratio(A, hub_to_tip);
+rm = mean_radius_from_rule(rt, rh, mean_radius_rule);
+d = struct('label',label,'mdot',mdot,'rho',rho,'Vx',Vx,'A',A, ...
+    'rt',rt,'rh',rh,'rm',rm,'hub_to_tip',hub_to_tip, ...
+    'mean_radius_rule',mean_radius_rule);
 end
 
 function [T,p,rho] = inlet_static_from_Vx(T0,p0,Vx,air)
@@ -2455,6 +3088,32 @@ details = struct('model','hall_denton_cd_baseline', ...
     'Vx',VxVals,'velocity_scale',max(v_out_mean,1e-8));
 end
 
+function eta_penalty = loss_efficiency_penalty_breakdown(loss, W2, V3, Delta_h0)
+%LOSS_EFFICIENCY_PENALTY_BREAKDOWN Convert zeta source terms to eta penalties.
+% Rotor loss is scaled with W2^2 and stator loss with V3^2, matching the
+% meanline stage-efficiency estimate used in the main routine.
+sources = {'profile','trailing_edge','shock','tip','endwall'};
+eta_penalty = struct();
+eta_penalty.rotor = struct();
+eta_penalty.stator = struct();
+eta_penalty.total = 0;
+Delta_safe = max(Delta_h0,eps);
+for k = 1:numel(sources)
+    src = sources{k};
+    zr = 0;
+    zs = 0;
+    if isfield(loss,'breakdown') && isfield(loss.breakdown,'rotor') && isfield(loss.breakdown.rotor,src)
+        zr = loss.breakdown.rotor.(src);
+    end
+    if isfield(loss,'breakdown') && isfield(loss.breakdown,'stator') && isfield(loss.breakdown.stator,src)
+        zs = loss.breakdown.stator.(src);
+    end
+    eta_penalty.rotor.(src) = 0.5*zr*W2^2/Delta_safe;
+    eta_penalty.stator.(src) = 0.5*zs*V3^2/Delta_safe;
+    eta_penalty.total = eta_penalty.total + eta_penalty.rotor.(src) + eta_penalty.stator.(src);
+end
+end
+
 function val = field_or(s, name, defaultVal)
 if isfield(s,name)
     val = s.(name);
@@ -2487,3 +3146,16 @@ p = p0 * (T/T0)^(g/(R*L));
 rho = p/(R*T);
 amb = struct('T',T,'p',p,'rho',rho,'a',sqrt(1.4*R*T));
 end
+
+
+function RR = recovery_ratio_from_angles(alpha1, beta2, phi)
+%RECOVERY_RATIO_FROM_ANGLES Cumpsty/course compressor recovery-ratio expression.
+% alpha1 and beta2 must be provided using the derivation's convention. In the
+% default code path alpha1 is signed absolute inlet swirl, while beta2 is the
+% positive geometric rotor-exit relative angle given by beta2_RR=-beta2_code.
+phi_safe = max(phi,1e-12);
+RR = (cos(beta2)^2 * tan(beta2))/phi_safe ...
+   - (cos(alpha1)^2 * cos(beta2)^2 * tan(alpha1)*tan(beta2))/max(phi_safe^2,1e-12) ...
+   + (cos(alpha1)^2 * tan(alpha1))/phi_safe;
+end
+

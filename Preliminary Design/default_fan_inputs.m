@@ -34,20 +34,41 @@ in.R   = 0.65;
 %                               continuity is satisfied at that phi. This is
 %                               useful when frontal area is allowed to change.
 %   'sweep_project_constraints' :
-%                               recommended mode for this assignment helper.
-%                               Sweeps phi, psi and R inside hard limits,
-%                               checks the fixed project quantities with a
-%                               +/- tolerance, and selects a good starting
-%                               point for MEANGEN.
+%                               continuity-first helper. Mx, mdot and hub-to-tip
+%                               define r_m, so phi is computed rather than swept.
+%   'sweep_fixed_mean_radius_duty' :
+%                               Denton/MEANGEN-style helper. A fixed design
+%                               mean radius is used, phi and psi are swept,
+%                               alpha1 can be fixed at zero, and R is then
+%                               computed from the velocity-triangle relation.
 %   'project_fixed_candidate' :
 %                               internal single-candidate mode used by the
-%                               sweep.
+%                               sweeps.
 %   'solve_phi_psi_from_mach_pr' :
 %                               legacy mode retained for back-comparison.
 %in.design.solve_mode = 'solve_phi_from_geometry';
 %in.design.solve_mode = 'solve_area_from_phi';
 %in.design.solve_mode = 'solve_phi_psi_from_mach_pr';
-in.design.solve_mode = 'sweep_project_constraints';
+%in.design.solve_mode = 'sweep_project_constraints';
+in.design.solve_mode = 'sweep_fixed_mean_radius_duty';
+
+% Project geometry closure.
+% use_continuity_fixed_radius keeps the older continuity-first closure in
+% which Mx, mdot and hub-to-tip ratio define the annulus and r_m, so phi is
+% computed from Vx/(Omega*r_m).  The Denton/MEANGEN-style mode below instead
+% uses a fixed mean radius and sweeps phi directly.
+in.design.use_continuity_fixed_radius = true;
+
+% Fixed-mean-radius duty sweep settings.  This follows the MULTALL/MEANGEN
+% philosophy: provide a preliminary mean radius, flow coefficient, loading
+% coefficient and reaction/angle set, then let MEANGEN/STAGEN/MULTALL refine
+% blade shape and annulus details.  If fixed_mean_radius_m is NaN, the code
+% uses the continuity radius as a reference and multiplies it by
+% fixed_mean_radius_scale.  Set fixed_mean_radius_m to impose a larger radius
+% directly, e.g. 0.45 or 0.48 m.
+in.design.fixed_mean_radius_m = NaN;       % NaN -> use continuity reference radius
+in.design.fixed_mean_radius_scale = 1.00;  % applied only when fixed_mean_radius_m is NaN
+in.design.fixed_mean_radius_note = 'Set fixed_mean_radius_m to impose MEANGEN design radius explicitly.';
 
 % Sizing basis suggested by project
 in.Mx_design = 0.60;
@@ -83,15 +104,23 @@ in.design.phi_min = 0.40;
 in.design.phi_max = 1.10;
 
 % Duty-coefficient sweep resolution for the fast preliminary search.
-in.design.phi_search_points = 13;   % coarse but much faster; refine manually if needed
+in.design.phi_search_points = 15;   % coarse backbone; augmented near mdot target below
 in.design.psi_search_points = 11;
 in.design.R_search_points = 21;
+
+% Add local phi samples around the value implied by mdot, Mx, RPM and htr.
+% This keeps the sweep fast while avoiding a large mdot miss caused only by
+% coarse phi spacing. The exact phi is not forced; it is just inserted into
+% the candidate list and then ranked by the objective.
+in.design.phi_grid_include_mdot_target = true;
+in.design.phi_grid_mdot_refine_half_width = 0.08;
+in.design.phi_grid_mdot_refine_points = 9;
 
 % Explore the no-IGV option without making it mandatory.
 %   'free' : alpha1 follows from phi, psi and R.
 %   'zero' : enforce alpha1 = alpha1_deg, so R follows from R=1-phi*tan(alpha1)-psi/2.
 %   'both' : search both families and let constraints/objective choose.
-in.design.alpha1_mode = 'both';
+in.design.alpha1_mode = 'zero';   % hard no-IGV default for the fixed-radius duty sweep
 in.design.alpha1_deg = 0;
 
 % Fixed project quantities are allowed to deviate only by this relative tolerance.
@@ -99,7 +128,19 @@ in.design.fixed_tolerance_rel = 0.02;
 
 % Recovery ratio is reported as a soft stability metric, not a hard rejection.
 in.design.RR_soft_min = 0.50;
-in.design.RR_penalty_weight = 1.0;
+% Recovery-ratio stability is still soft by default, but it is now weighted
+% strongly enough that negative RR candidates should not win unless no
+% reasonable alternative exists. Set to 0 to ignore RR in ranking.
+in.design.RR_penalty_weight = 2.00;
+% RR stability equation convention. Default matches the course derivation:
+% alpha1 remains signed absolute inlet swirl, while beta2_RR = -beta2_code
+% because Vtheta2 = U - Vx*tan(beta2_RR). 'signed' and
+% 'positive_magnitudes_legacy' are diagnostic-only sensitivity options.
+in.design.RR_angle_convention = 'lecture_signed_alpha_beta2_positive';
+% Optional hard rejection switch. With the corrected positive-angle RR
+% convention, candidates below RR_soft_min are rejected by default because
+% they are poor stability starting points. Set false for exploratory sweeps.
+in.design.enforce_RR_as_hard = true;
 
 % Soft duty preference. This prevents a least-loss/least-violation sweep from
 % automatically sitting on R = 1 unless that is truly needed. Set the weight
@@ -109,7 +150,7 @@ in.design.R_penalty_weight = 0.03;
 
 % Command-window progress messages.
 in.design.status_print = true;
-in.design.status_every = 100;
+in.design.status_every = 1000;
 
 % Meanline mass-flow constraint. In the recommended Mach/PR mode, Vx is
 % fixed by Mx and density, while mdot fixes the annulus area. The hub radius
@@ -125,13 +166,33 @@ in.design.mdot_tolerance_rel = 0.02;           % project +/-2% tolerance
 in.design.include_mdot_constraint = true;
 in.design.enforce_project_matching_as_hard = false;
 in.design.enforce_beta_tt_range_as_hard = false;
-in.design.mdot_penalty_weight = 1.0;
-in.design.Mrel_tip_penalty_weight = 0.50;
+% Absolute-error penalties are disabled by default so that values inside
+% the +/- fixed_tolerance_rel project band are not punished. Excess penalties
+% below activate only after the 2% tolerance band is exceeded.
+in.design.mdot_penalty_weight = 0.00;
+in.design.Mrel_tip_penalty_weight = 0.00;
+in.design.mdot_excess_penalty_weight = 25.0;
+in.design.Mrel_tip_excess_penalty_weight = 6.0;
+in.design.beta_tt_excess_penalty_weight = 4.0;
 
 % Mean-radius interpretation used after hub and tip radii are known.
 %   'arithmetic' : r_m = 0.5*(r_t + r_h)
 %   'area'       : r_m = sqrt(0.5*(r_t^2 + r_h^2))
 in.design.mean_radius_rule = 'arithmetic';
+
+% Tip relative Mach matching. In the continuity-first baseline, mdot, rho,
+% Vx and hub-to-tip ratio define a reference r_m. For the MEANGEN/MULTALL
+% starting point, the code may slightly rescale r_m about that continuity
+% value to match the project Mrel_tip target. The mass-flow mismatch created
+% by this rescaling is reported, but by default is not used to rank/reject
+% candidates because the downstream fixed-mdot simulations can change blade
+% shape/throttle to carry the prescribed mass flow.
+in.design.match_Mrel_tip_by_mean_radius = false;
+in.design.Mrel_tip_radius_match_max_rel = 0.20;       % +/- allowed r_m change around continuity radius
+in.design.Mrel_tip_radius_match_tol_rel = 0.02;       % same +/-2% tolerance used for project checks
+in.design.enforce_Mrel_tip_as_hard = false;           % fixed-radius mode reports this; set true once radius can satisfy it
+in.design.relax_mdot_penalty_when_matching_tip_radius = true;
+in.design.relax_mdot_penalty_in_fixed_radius_duty = true;
 
 
 % Feasibility / constraint settings
@@ -154,10 +215,12 @@ in.design.R_min = 0.00;
 in.design.R_max = 1.00;
 % in.design.R_search_points is defined above for the sweep.
 
-% Solidity sizing. The code starts from DF_sizing_target and then searches
-% for the minimum solidity that satisfies Howell and DF_min <= DF <= DF_limit.
+% Solidity sizing. The default policy computes the solidity from the target
+% DF (0.45), then only increases solidity if needed to satisfy Howell turning
+% while remaining inside DF_min <= DF <= DF_limit. This avoids blindly using
+% the lowest feasible solidity.
 in.design.solidity_mode = 'from_DF_Howell';  % 'fixed' or 'from_DF_Howell'
-in.design.solidity_policy = 'minimum_solidity_feasible';  % or 'closest_to_df_target'
+in.design.solidity_policy = 'DF_target_then_Howell';  % alternatives: 'closest_to_df_target', 'minimum_solidity_feasible'
 in.design.solidity_min = 0.80;
 in.design.solidity_max = 3.50;
 in.design.solidity_search_points = 250;   % was 1200; vectorized search, adequate for preliminary sweep
@@ -167,16 +230,57 @@ in.alpha3_deg = 0;
 
 % Plot switches
 in.plot.enable_duty_sweep = false;
+% Diagnostic plot of beta_tt versus mdot from the preliminary sweep history.
+% This is NOT a true fixed-geometry compressor characteristic unless the
+% sampled points come from an off-design/fixed-geometry calculation. It is
+% Speedline / beta_tt-mdot plotting
+% A true compressor speedline requires fixed-geometry off-design points
+% (different throttle/back-pressure/mass-flow solutions at the same speed).
+% The preliminary design sweep changes duty variables and sometimes geometry,
+% so it must not be interpreted as a choke/surge speedline. Keep the old
+% diagnostic off by default to avoid a misleading plot.
+in.plot.enable_beta_mdot_map = false;
+in.plot.beta_mdot_only_feasible = true;
+in.plot.beta_mdot_save_png = true;
+in.plot.beta_mdot_png_name = 'beta_tt_vs_mdot_preliminary_sweep.png';
 
-% Geometry guesses
-in.rotor_chord = 0.060;       % m
-in.stator_chord = 0.050;      % m
-in.rotor_solidity = 1.35;     % c/s
-in.stator_solidity = 1.25;    % c/s
+% Geometry / blade-count closure
+% The active closure below uses solidity from the DF/Howell loop. For each
+% integer blade-count combination in the sweep, pitch follows from
+% s = 2*pi*r_m/Z and chord follows from c = sigma*s. A fixed t/c assumption
+% then sets blade thickness for the Lieblein and loss-model inputs.
+%
+% The chord values below are only fallbacks/initial guesses for the fixed
+% chord mode or for the first Re estimate before the reverse closure updates
+% them.
+in.rotor_chord = 0.060;       % m, fallback/initial guess only in blade-count closure
+in.stator_chord = 0.050;      % m, fallback/initial guess only in blade-count closure
+in.rotor_solidity = 1.35;     % c/s, overwritten when solidity_mode='from_DF_Howell'
+in.stator_solidity = 1.25;    % c/s, overwritten when solidity_mode='from_DF_Howell'
 in.rotor_pitch = in.rotor_chord / in.rotor_solidity;
 in.stator_pitch = in.stator_chord / in.stator_solidity;
-in.rotor_thickness = 0.004;
+in.rotor_thickness = 0.10*in.rotor_chord;
+in.stator_thickness = 0.10*in.stator_chord;
 in.blade_height_factor = 0.9;
+
+% Reverse closure from solidity to chord using integer blade counts.
+in.design.chord_closure_mode = 'blade_count_from_solidity';  % 'fixed_chord' or 'blade_count_from_solidity'
+
+% Blade-count handling:
+%   'sweep_in_objective'      : old behavior; Z_R/Z_S are swept and can affect the selected objective.
+%   'postprocess_table_only'  : recommended behavior; the duty/solidity solution is selected first,
+%                               then all blade-count combinations are tabulated afterwards. This avoids
+%                               artificial lower/upper Z preferences from weak meanline loss sensitivity.
+in.design.blade_count_selection_mode = 'postprocess_table_only';
+in.design.blade_count_sweep = true; % only used when blade_count_selection_mode='sweep_in_objective'
+in.design.rotor_blade_count_range = 20:40;
+in.design.stator_vane_count_range = 20:60;
+in.design.rotor_blade_count_default = 30;  % reference only in postprocess_table_only mode
+in.design.stator_vane_count_default = 40;  % reference only in postprocess_table_only mode
+in.design.t_over_c = 0.10;
+in.design.rotor_t_over_c = 0.10;
+in.design.stator_t_over_c = 0.10;
+in.design.chord_solidity_iterations = 6;
 
 % Leakage defaults
 in.rotor_tip_clearance = 0.0005;   % m
@@ -209,7 +313,7 @@ in.howell_paths.Psi_sc  = fullfile(base_dir,'Howell_Psi_solidityINVERSE.csv');
 % to the MATLAB current working directory.
 in.lieblein.enabled = true;
 in.lieblein.profile_family = 'NACA65';      % 'NACA65' or 'DCA'
-in.lieblein.default_tmax_over_c = 0.070;    % used if row-specific t/c is not supplied
+in.lieblein.default_tmax_over_c = 0.100;    % used if row-specific t/c is not supplied
 in.lieblein.rotor_tmax_over_c = NaN;        % NaN -> rotor_thickness/rotor_chord
 in.lieblein.stator_tmax_over_c = NaN;       % NaN -> default_tmax_over_c
 in.lieblein.Ki_sh_DCA = 0.7;
@@ -409,13 +513,17 @@ in.loss_model.tip.stator_uPS_over_Vx = NaN;
 in.loss_model.tip.stator_x_over_Cs = NaN;
 
 % 5) Endwall boundary-layer loss baseline
+% Disabled by default in v8 because the preliminary optimizer can otherwise
+% use the simplified chord-dependent endwall term to bias blade-count/chord
+% selection. Keep the model available for sensitivity checks, but do not use
+% it as a geometry-selection driver.
 % Supported models:
 %   'hall_denton_cd_baseline' : Hall/Denton constant-C_D endwall BL
 %                               dissipation only. This is NOT a full
 %                               secondary-flow/corner-separation model.
 %   'user_constant'           : row-wise constant zeta placeholders below.
-in.loss_model.endwall.enabled_rotor = true;
-in.loss_model.endwall.enabled_stator = true;
+in.loss_model.endwall.enabled_rotor = false;
+in.loss_model.endwall.enabled_stator = false;
 in.loss_model.endwall.model = 'hall_denton_cd_baseline';
 in.loss_model.endwall.secondary_model = 'none';       % reserved for future MULTALL/STAGEN extraction
 
